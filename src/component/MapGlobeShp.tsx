@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import shp from "shpjs";
 
@@ -7,6 +7,13 @@ import "maplibre-gl/dist/maplibre-gl.css";
 
 const AUTO_ZOOM_FEATURE_LIMIT = 5000;
 const LARGE_SEARCH_FEATURE_LIMIT = 50000;
+const ARROW_STORAGE_PREFIX = "test-shapefile-map:arrows";
+const ARROW_SOURCE_ID = "annotation-arrows-source";
+const ARROW_LINE_LAYER_ID = "annotation-arrows-line";
+const ARROW_HEAD_LAYER_ID = "annotation-arrows-head";
+const ARROW_HEAD_LENGTH = 0.00035;
+const ARROW_HEAD_ANGLE = Math.PI / 7;
+const MIN_DRAW_POINT_DISTANCE_PX = 10;
 const TOUR_STEPS = [
   {
     title: "เลือกไฟล์ SHP",
@@ -40,6 +47,13 @@ const LAYER_COLORS = [
 ];
 
 type GeoJsonFeature = GeoJSON.Feature<GeoJSON.Geometry, Record<string, any>>;
+type LngLatTuple = [number, number];
+
+interface ArrowAnnotation {
+  id: string;
+  points: LngLatTuple[];
+  label: string;
+}
 
 interface ShapeLayer {
   id: string;
@@ -102,19 +116,203 @@ const buildPopupHtml = (props: Record<string, any> = {}) => {
   return `<div style="padding:10px; font-size:11px; max-width:280px;"><b>Info</b><hr/>${rows}</div>`;
 };
 
+const getArrowProjectKey = (file: File) => `${ARROW_STORAGE_PREFIX}:${file.name}:${file.size}`;
+
+const isLngLatTuple = (value: unknown): value is LngLatTuple =>
+  Array.isArray(value) &&
+  value.length === 2 &&
+  typeof value[0] === "number" &&
+  typeof value[1] === "number";
+
+const normalizeArrow = (value: any, index: number): ArrowAnnotation | null => {
+  if (Array.isArray(value?.points)) {
+    const points = value.points.filter(isLngLatTuple);
+    if (points.length >= 2) {
+      return {
+        id: String(value.id || `arrow-${index}`),
+        points,
+        label: String(value.label || `Arrow ${index + 1}`),
+      };
+    }
+  }
+
+  if (isLngLatTuple(value?.start) && isLngLatTuple(value?.end)) {
+    return {
+      id: String(value.id || `arrow-${index}`),
+      points: [value.start, value.end],
+      label: String(value.label || `Arrow ${index + 1}`),
+    };
+  }
+
+  return null;
+};
+
+const loadSavedArrows = (projectKey: string): ArrowAnnotation[] => {
+  try {
+    const raw = localStorage.getItem(projectKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.flatMap((item, index) => {
+          const arrow = normalizeArrow(item, index);
+          return arrow ? [arrow] : [];
+        })
+      : [];
+  } catch {
+    return [];
+  }
+};
+
+const saveArrows = (projectKey: string, arrows: ArrowAnnotation[]) => {
+  if (!projectKey) return;
+  localStorage.setItem(projectKey, JSON.stringify(arrows));
+};
+
+const getArrowHeadLines = (start: LngLatTuple, end: LngLatTuple) => {
+  const [startLng, startLat] = start;
+  const [endLng, endLat] = end;
+  const angle = Math.atan2(endLat - startLat, endLng - startLng);
+
+  return [angle - ARROW_HEAD_ANGLE, angle + ARROW_HEAD_ANGLE].map((wingAngle) => {
+    const wingPoint: LngLatTuple = [
+      endLng - Math.cos(wingAngle) * ARROW_HEAD_LENGTH,
+      endLat - Math.sin(wingAngle) * ARROW_HEAD_LENGTH,
+    ];
+
+    return [end, wingPoint] as [LngLatTuple, LngLatTuple];
+  });
+};
+
+const buildArrowGeoJson = (
+  arrows: ArrowAnnotation[],
+): GeoJSON.FeatureCollection<GeoJSON.Geometry, Record<string, any>> => ({
+  type: "FeatureCollection",
+  features: arrows.flatMap((arrow) => {
+    if (arrow.points.length < 2) return [];
+
+    const lastPoint = arrow.points[arrow.points.length - 1];
+    const previousPoint = arrow.points[arrow.points.length - 2];
+
+    const headLines = getArrowHeadLines(previousPoint, lastPoint);
+
+    return [
+      {
+        type: "Feature" as const,
+        geometry: {
+          type: "LineString" as const,
+          coordinates: arrow.points,
+        },
+        properties: {
+          id: arrow.id,
+          kind: "arrow-line",
+          label: arrow.label,
+        },
+      },
+      ...headLines.map((coordinates, headIndex) => ({
+        type: "Feature" as const,
+        geometry: {
+          type: "LineString" as const,
+          coordinates,
+        },
+        properties: {
+          id: `${arrow.id}-head-${headIndex}`,
+          kind: "arrow-head",
+          label: arrow.label,
+        },
+      })),
+    ];
+  }),
+});
+
+const addArrowLayers = (map: maplibregl.Map, arrows: ArrowAnnotation[]) => {
+  if (map.getSource(ARROW_SOURCE_ID)) return;
+
+  map.addSource(ARROW_SOURCE_ID, {
+    type: "geojson",
+    data: buildArrowGeoJson(arrows),
+  });
+
+  map.addLayer({
+    id: ARROW_LINE_LAYER_ID,
+    type: "line",
+    source: ARROW_SOURCE_ID,
+    filter: ["==", ["get", "kind"], "arrow-line"],
+    paint: {
+      "line-color": "#facc15",
+      "line-width": 4,
+      "line-opacity": 0.95,
+    },
+  });
+
+  map.addLayer({
+    id: ARROW_HEAD_LAYER_ID,
+    type: "line",
+    source: ARROW_SOURCE_ID,
+    filter: ["==", ["get", "kind"], "arrow-head"],
+    paint: {
+      "line-color": "#facc15",
+      "line-width": 4,
+      "line-opacity": 0.95,
+    },
+    layout: {
+      "line-cap": "round",
+      "line-join": "round",
+    },
+  });
+};
+
 const MapGlobeShp = () => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const popupLayerIdsRef = useRef<Set<string>>(new Set());
+  const projectKeyRef = useRef("");
+  const arrowAnnotationsRef = useRef<ArrowAnnotation[]>([]);
+  const isDrawingArrowRef = useRef(false);
+  const draftArrowPointsRef = useRef<LngLatTuple[]>([]);
 
   const [shapeLayers, setShapeLayers] = useState<ShapeLayer[]>([]);
   const [selectedLayerId, setSelectedLayerId] = useState<string>("");
   const [featureSearch, setFeatureSearch] = useState("");
   const [openingLayerId, setOpeningLayerId] = useState<string>("");
+  const [projectKey, setProjectKey] = useState("");
+  const [arrowAnnotations, setArrowAnnotations] = useState<ArrowAnnotation[]>([]);
+  const [isDrawingArrow, setIsDrawingArrow] = useState(false);
+  const [draftArrowPoints, setDraftArrowPoints] = useState<LngLatTuple[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [statusText, setStatusText] = useState("");
   const [tourStep, setTourStep] = useState<number | null>(null);
+
+  useEffect(() => {
+    projectKeyRef.current = projectKey;
+  }, [projectKey]);
+
+  useEffect(() => {
+    arrowAnnotationsRef.current = arrowAnnotations;
+  }, [arrowAnnotations]);
+
+  useEffect(() => {
+    isDrawingArrowRef.current = isDrawingArrow;
+  }, [isDrawingArrow]);
+
+  useEffect(() => {
+    draftArrowPointsRef.current = draftArrowPoints;
+  }, [draftArrowPoints]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    map.getCanvas().style.cursor = isDrawingArrow ? "crosshair" : "";
+
+    if (isDrawingArrow) {
+      map.dragPan.disable();
+      map.doubleClickZoom.disable();
+    } else {
+      map.dragPan.enable();
+      map.doubleClickZoom.enable();
+    }
+  }, [isDrawingArrow]);
 
   const handleResetToGlobe = () => {
     mapRef.current?.flyTo({
@@ -125,6 +323,122 @@ const MapGlobeShp = () => {
       essential: true,
       duration: 2000,
     });
+  };
+
+  const updateArrowSource = (arrows: ArrowAnnotation[]) => {
+    const map = mapRef.current;
+    if (!map || !map.isStyleLoaded()) return;
+
+    if (!map.getSource(ARROW_SOURCE_ID)) {
+      addArrowLayers(map, arrows);
+      return;
+    }
+
+    const source = map.getSource(ARROW_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+    source?.setData(buildArrowGeoJson(arrows));
+  };
+
+  const getRenderedArrows = (savedArrows: ArrowAnnotation[], draftPoints: LngLatTuple[]) => [
+    ...savedArrows,
+    ...(draftPoints.length >= 2
+      ? [
+          {
+            id: "draft-arrow",
+            points: draftPoints,
+            label: "Draft Arrow",
+          },
+        ]
+      : []),
+  ];
+
+  const appendDraftPoint = useCallback((point: LngLatTuple, force = false) => {
+    const current = draftArrowPointsRef.current;
+    const lastPoint = current[current.length - 1];
+    const map = mapRef.current;
+
+    const distance = (() => {
+      if (!map || !lastPoint) return Infinity;
+      const lastScreenPoint = map.project(lastPoint);
+      const nextScreenPoint = map.project(point);
+      return Math.hypot(nextScreenPoint.x - lastScreenPoint.x, nextScreenPoint.y - lastScreenPoint.y);
+    })();
+
+    if (lastPoint && !force && distance < MIN_DRAW_POINT_DISTANCE_PX) {
+      return current;
+    }
+
+    const nextPoints = [...current, point];
+    draftArrowPointsRef.current = nextPoints;
+    setDraftArrowPoints(nextPoints);
+    return nextPoints;
+  }, []);
+
+  const setAndSaveArrows = (nextArrows: ArrowAnnotation[]) => {
+    setArrowAnnotations(nextArrows);
+    saveArrows(projectKeyRef.current, nextArrows);
+  };
+
+  const handleToggleArrowDrawing = () => {
+    const nextDrawing = !isDrawingArrow;
+    setIsDrawingArrow(nextDrawing);
+    setDraftArrowPoints([]);
+    setStatusText(
+      nextDrawing
+        ? "โหมดวาดลูกศร: คลิก 1 ครั้งเพื่อเริ่ม ลากตามแนว แล้วดับเบิลคลิกเพื่อจบ"
+        : "ปิดโหมดวาดลูกศร",
+    );
+  };
+
+  const handleFinishArrow = () => {
+    if (draftArrowPoints.length < 2) {
+      setStatusText("ต้องมีอย่างน้อย 2 จุดก่อนจบลูกศร");
+      return;
+    }
+
+    const nextArrows = [
+      ...arrowAnnotations,
+      {
+        id: `arrow-${Date.now()}`,
+        points: draftArrowPoints,
+        label: `Arrow ${arrowAnnotations.length + 1}`,
+      },
+    ];
+
+    setAndSaveArrows(nextArrows);
+    setDraftArrowPoints([]);
+    draftArrowPointsRef.current = [];
+    setStatusText(`บันทึกลูกศรแล้ว ${draftArrowPoints.length} จุด`);
+  };
+
+  const handleUndoDraftPoint = () => {
+    const nextPoints = draftArrowPoints.slice(0, -1);
+    setDraftArrowPoints(nextPoints);
+    draftArrowPointsRef.current = nextPoints;
+    setStatusText(
+      nextPoints.length
+        ? `ลบจุดล่าสุดแล้ว เหลือ ${nextPoints.length} จุด`
+        : "ลบจุดร่างทั้งหมดแล้ว",
+    );
+  };
+
+  const handleUndoArrow = () => {
+    const nextArrows = arrowAnnotations.slice(0, -1);
+    setAndSaveArrows(nextArrows);
+    setDraftArrowPoints([]);
+    draftArrowPointsRef.current = [];
+    setStatusText(
+      nextArrows.length
+        ? `ลบลูกศรล่าสุดแล้ว เหลือ ${nextArrows.length} อัน`
+        : "ลบลูกศรล่าสุดแล้ว",
+    );
+  };
+
+  const handleClearSavedArrows = () => {
+    setArrowAnnotations([]);
+    setDraftArrowPoints([]);
+    draftArrowPointsRef.current = [];
+    if (projectKeyRef.current) localStorage.removeItem(projectKeyRef.current);
+    setStatusText("ลบลูกศรของไฟล์นี้แล้ว");
   };
 
   const zoomToFeatures = (features: GeoJsonFeature[]) => {
@@ -171,6 +485,10 @@ const MapGlobeShp = () => {
     if (map.getSource(layer.sourceId)) map.removeSource(layer.sourceId);
   };
 
+  useEffect(() => {
+    updateArrowSource(getRenderedArrows(arrowAnnotations, draftArrowPoints));
+  }, [arrowAnnotations, draftArrowPoints]);
+
   const clearLoadedLayers = () => {
     shapeLayers.forEach(removeLayerFromMap);
     popupLayerIdsRef.current.clear();
@@ -182,6 +500,7 @@ const MapGlobeShp = () => {
 
     popupLayerIdsRef.current.add(layerId);
     map.on("click", layerId, (e) => {
+      if (isDrawingArrowRef.current) return;
       if (!e.features || e.features.length === 0) return;
       new maplibregl.Popup()
         .setLngLat(e.lngLat)
@@ -190,11 +509,15 @@ const MapGlobeShp = () => {
     });
 
     map.on("mouseenter", layerId, () => {
+      if (isDrawingArrowRef.current) {
+        map.getCanvas().style.cursor = "crosshair";
+        return;
+      }
       map.getCanvas().style.cursor = "pointer";
     });
 
     map.on("mouseleave", layerId, () => {
-      map.getCanvas().style.cursor = "";
+      map.getCanvas().style.cursor = isDrawingArrowRef.current ? "crosshair" : "";
     });
   };
 
@@ -357,7 +680,7 @@ const MapGlobeShp = () => {
       reader.readAsArrayBuffer(file);
     });
 
-  const loadShapeBuffer = async (buffer: ArrayBuffer, label: string) => {
+  const loadShapeBuffer = async (buffer: ArrayBuffer, label: string, nextProjectKey: string) => {
     if (!mapRef.current) return;
 
     setIsLoading(true);
@@ -369,6 +692,7 @@ const MapGlobeShp = () => {
       clearLoadedLayers();
       const result: any = await shp(buffer);
       const collections = Array.isArray(result) ? result : [result];
+      const savedArrows = loadSavedArrows(nextProjectKey);
 
       const nextLayers: ShapeLayer[] = collections.map((collection: any, index: number) => {
         const id = `shape-${index}`;
@@ -396,8 +720,14 @@ const MapGlobeShp = () => {
 
       setShapeLayers(nextLayers);
       setSelectedLayerId(nextLayers[0]?.id || "");
+      setProjectKey(nextProjectKey);
+      setArrowAnnotations(savedArrows);
       setFeatureSearch("");
-      setStatusText(`อ่านไฟล์แล้ว ${nextLayers.length} layer - ปิดไว้ทั้งหมด`);
+      setStatusText(
+        `อ่านไฟล์แล้ว ${nextLayers.length} layer - ปิดไว้ทั้งหมด${
+          savedArrows.length ? ` | โหลดลูกศร ${savedArrows.length} อัน` : ""
+        }`,
+      );
     } catch (err) {
       console.error(err);
       setStatusText("ไฟล์เสีย หรือโครงสร้าง Zip ไม่ถูกต้อง");
@@ -411,10 +741,11 @@ const MapGlobeShp = () => {
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const nextProjectKey = getArrowProjectKey(file);
     setIsLoading(true);
     setUploadProgress(0);
     try {
-      await loadShapeBuffer(await readZipFile(file), file.name);
+      await loadShapeBuffer(await readZipFile(file), file.name, nextProjectKey);
     } catch (err) {
       console.error(err);
       setStatusText("อ่านไฟล์ไม่สำเร็จ");
@@ -429,6 +760,11 @@ const MapGlobeShp = () => {
     clearLoadedLayers();
     setShapeLayers([]);
     setSelectedLayerId("");
+    setProjectKey("");
+    setArrowAnnotations([]);
+    setIsDrawingArrow(false);
+    setDraftArrowPoints([]);
+    draftArrowPointsRef.current = [];
     setFeatureSearch("");
     setOpeningLayerId("");
     setUploadProgress(null);
@@ -461,15 +797,66 @@ const MapGlobeShp = () => {
 
     map.on("load", () => {
       map.setProjection({ type: "globe" });
+      addArrowLayers(map, arrowAnnotationsRef.current);
 
       map.on("zoom", () => {
         if (map.getZoom() > 17) map.setZoom(17);
       });
     });
 
+    map.on("click", (event) => {
+      if (!isDrawingArrowRef.current) return;
+
+      const clickedPoint: LngLatTuple = [event.lngLat.lng, event.lngLat.lat];
+
+      if (draftArrowPointsRef.current.length > 0) return;
+
+      const nextPoints = appendDraftPoint(clickedPoint, true);
+      setStatusText(
+        nextPoints.length === 1
+          ? "เริ่มลูกศรแล้ว: ลาก/ขยับเมาส์ตามแนว แล้วดับเบิลคลิกเพื่อจบ"
+          : `เพิ่มจุดที่ ${nextPoints.length} แล้ว`,
+      );
+    });
+
+    map.on("mousemove", (event) => {
+      if (!isDrawingArrowRef.current || draftArrowPointsRef.current.length === 0) return;
+
+      const movedPoint: LngLatTuple = [event.lngLat.lng, event.lngLat.lat];
+      appendDraftPoint(movedPoint);
+    });
+
+    map.on("dblclick", (event) => {
+      if (!isDrawingArrowRef.current) return;
+      event.preventDefault();
+
+      const endPoint: LngLatTuple = [event.lngLat.lng, event.lngLat.lat];
+      const nextPoints = appendDraftPoint(endPoint, true);
+
+      if (nextPoints.length < 2) {
+        setStatusText("ลากให้มีอย่างน้อย 2 จุดก่อนจบลูกศร");
+        return;
+      }
+
+      const nextArrows = [
+        ...arrowAnnotationsRef.current,
+        {
+          id: `arrow-${Date.now()}`,
+          points: nextPoints,
+          label: `Arrow ${arrowAnnotationsRef.current.length + 1}`,
+        },
+      ];
+
+      setArrowAnnotations(nextArrows);
+      saveArrows(projectKeyRef.current, nextArrows);
+      setDraftArrowPoints([]);
+      draftArrowPointsRef.current = [];
+      setStatusText(`บันทึกลูกศรแล้ว ${nextPoints.length} จุด`);
+    });
+
     mapRef.current = map;
     return () => map.remove();
-  }, []);
+  }, [appendDraftPoint]);
 
   const selectedLayer = shapeLayers.find((layer) => layer.id === selectedLayerId);
   const activeTourStep = tourStep === null ? null : TOUR_STEPS[tourStep];
@@ -539,6 +926,90 @@ const MapGlobeShp = () => {
           <button onClick={() => setTourStep(0)} style={tourStartButtonStyle}>
             เริ่มทัวร์
           </button>
+          <div style={arrowToolWrapStyle}>
+            <button
+              onClick={handleToggleArrowDrawing}
+              disabled={!shapeLayers.length}
+              style={{
+                ...arrowToolButtonStyle,
+                background: isDrawingArrow ? "#facc15" : "#0f172a",
+                color: isDrawingArrow ? "#111827" : "#e5e7eb",
+                cursor: shapeLayers.length ? "pointer" : "not-allowed",
+              }}
+            >
+              {isDrawingArrow ? "กำลังวาดลูกศร" : "วาดลูกศร"}
+            </button>
+            <button
+              onClick={handleUndoArrow}
+              disabled={!arrowAnnotations.length}
+              style={{
+                ...arrowToolButtonStyle,
+                background: "#334155",
+                cursor: arrowAnnotations.length ? "pointer" : "not-allowed",
+              }}
+            >
+              ย้อนลูกศร
+            </button>
+            <button
+              onClick={handleClearSavedArrows}
+              disabled={!arrowAnnotations.length}
+              style={{
+                ...arrowToolButtonStyle,
+                background: "#7f1d1d",
+                cursor: arrowAnnotations.length ? "pointer" : "not-allowed",
+              }}
+            >
+              ลบลูกศร
+            </button>
+          </div>
+          {isDrawingArrow && (
+            <div style={arrowToolWrapStyle}>
+              <button
+                onClick={handleFinishArrow}
+                disabled={draftArrowPoints.length < 2}
+                style={{
+                  ...arrowToolButtonStyle,
+                  background: "#0891b2",
+                  cursor: draftArrowPoints.length >= 2 ? "pointer" : "not-allowed",
+                }}
+              >
+                จบตอนนี้
+              </button>
+              <button
+                onClick={handleUndoDraftPoint}
+                disabled={!draftArrowPoints.length}
+                style={{
+                  ...arrowToolButtonStyle,
+                  background: "#475569",
+                  cursor: draftArrowPoints.length ? "pointer" : "not-allowed",
+                }}
+              >
+                ย้อนจุด
+              </button>
+              <button
+                onClick={() => {
+                  setDraftArrowPoints([]);
+                  setStatusText("ล้างจุดที่กำลังร่างแล้ว");
+                }}
+                disabled={!draftArrowPoints.length}
+                style={{
+                  ...arrowToolButtonStyle,
+                  background: "#1f2937",
+                  cursor: draftArrowPoints.length ? "pointer" : "not-allowed",
+                }}
+              >
+                ล้างร่าง
+              </button>
+            </div>
+          )}
+          <div style={arrowToolHintStyle}>
+            ลูกศร {arrowAnnotations.length} อัน
+            {projectKey ? " | บันทึกในเครื่องตามไฟล์นี้" : " | อัปโหลดไฟล์ก่อน"}
+            {isDrawingArrow && !draftArrowPoints.length ? " | คลิกบนแผนที่เพื่อเริ่ม" : ""}
+            {draftArrowPoints.length
+              ? ` | ร่างอยู่ ${draftArrowPoints.length} จุด ดับเบิลคลิกเพื่อจบ`
+              : ""}
+          </div>
         </div>
 
         {shapeLayers.length > 0 && (
@@ -761,6 +1232,30 @@ const tourStartButtonStyle: React.CSSProperties = {
   cursor: "pointer",
   fontSize: 12,
   fontWeight: 700,
+};
+
+const arrowToolWrapStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr 1fr",
+  gap: 6,
+  marginTop: 8,
+};
+
+const arrowToolButtonStyle: React.CSSProperties = {
+  minHeight: 34,
+  padding: "7px 8px",
+  color: "#fff",
+  border: "none",
+  borderRadius: 6,
+  fontSize: 11,
+  fontWeight: 800,
+};
+
+const arrowToolHintStyle: React.CSSProperties = {
+  marginTop: 8,
+  color: "#475569",
+  fontSize: 11,
+  lineHeight: 1.35,
 };
 
 const listContainerStyle: React.CSSProperties = {
