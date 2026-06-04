@@ -1,13 +1,22 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
-import shp from "shpjs";
 
 import "maplibre-gl/dist/maplibre-gl.css";
 
 const AUTO_ZOOM_FEATURE_LIMIT = 5000;
 const LARGE_SEARCH_FEATURE_LIMIT = 50000;
-const ARROW_STORAGE_PREFIX = "test-shapefile-map:arrows";
+const GEOMETRY_LABELS: Record<string, string> = {
+  Point: "จุด",
+  MultiPoint: "กลุ่มจุด",
+  LineString: "เส้น",
+  MultiLineString: "กลุ่มเส้น",
+  Polygon: "พื้นที่",
+  MultiPolygon: "กลุ่มพื้นที่",
+  GeometryCollection: "ข้อมูลผสม",
+};
+const LEGACY_ARROW_STORAGE_PREFIX = "test-shapefile-map:arrows";
+const ARROW_STORAGE_PREFIX = "test-shapefile-map:arrows:v2";
 const ARROW_SOURCE_ID = "annotation-arrows-source";
 const ARROW_LINE_LAYER_ID = "annotation-arrows-line";
 const ARROW_HEAD_LAYER_ID = "annotation-arrows-head";
@@ -22,7 +31,7 @@ const TOUR_STEPS = [
   },
   {
     title: "เปิด Layer ทีละชั้น",
-    body: "ทุก layer จะปิดไว้ก่อน กด ON เมื่อต้องการวาด layer นั้นบนแผนที่ เพื่อลดอาการค้าง",
+    body: "ทุกชั้นข้อมูลจะปิดไว้ก่อน กด เปิด เมื่อต้องการแสดงบนแผนที่ เพื่อลดอาการค้าง",
     target: "layers",
   },
   {
@@ -44,6 +53,14 @@ const LAYER_COLORS = [
   "#c084fc",
   "#22c55e",
   "#facc15",
+  "#38bdf8",
+  "#fb7185",
+  "#2dd4bf",
+  "#e879f9",
+  "#f59e0b",
+  "#818cf8",
+  "#4ade80",
+  "#f472b6",
 ];
 
 type GeoJsonFeature = GeoJSON.Feature<GeoJSON.Geometry, Record<string, any>>;
@@ -69,6 +86,21 @@ interface ShapeLayer {
   features: GeoJsonFeature[];
   loaded: boolean;
   visible: boolean;
+  detailLimited: boolean;
+}
+
+interface ParsedShapeCollection {
+  fileName?: string;
+  features: GeoJsonFeature[];
+  geometryTypes: string[];
+  featureCount: number;
+  detailLimited: boolean;
+}
+
+interface LoadStage {
+  current: number;
+  total: number;
+  label: string;
 }
 
 const getDisplayName = (rawName: string, index: number) => {
@@ -89,16 +121,26 @@ const getFeatureName = (feature: GeoJsonFeature, index: number) => {
   );
 };
 
-const extendBounds = (bounds: maplibregl.LngLatBounds, coordinates: any) => {
-  if (!coordinates) return;
+const extendBounds = (bounds: maplibregl.LngLatBounds, coordinates: unknown) => {
+  if (!Array.isArray(coordinates) || coordinates.length === 0) return;
+
   if (typeof coordinates[0] === "number") {
-    bounds.extend(coordinates as [number, number]);
+    const [lng, lat] = coordinates;
+    if (Number.isFinite(lng) && Number.isFinite(lat)) {
+      bounds.extend([lng, lat]);
+    }
     return;
   }
-  coordinates.forEach((coord: any) => extendBounds(bounds, coord));
+
+  coordinates.forEach((coord) => extendBounds(bounds, coord));
 };
 
-const extendGeometryBounds = (bounds: maplibregl.LngLatBounds, geometry: GeoJSON.Geometry) => {
+const extendGeometryBounds = (
+  bounds: maplibregl.LngLatBounds,
+  geometry: GeoJSON.Geometry | null | undefined,
+) => {
+  if (!geometry) return;
+
   if (geometry.type === "GeometryCollection") {
     geometry.geometries.forEach((item) => extendGeometryBounds(bounds, item));
     return;
@@ -113,7 +155,7 @@ const buildPopupHtml = (props: Record<string, any> = {}) => {
     .map(([key, value]) => `<div><b>${key}:</b> ${String(value ?? "")}</div>`)
     .join("");
 
-  return `<div style="padding:10px; font-size:11px; max-width:280px;"><b>Info</b><hr/>${rows}</div>`;
+  return `<div style="padding:10px; font-size:12px; max-width:280px;"><b>รายละเอียดข้อมูล</b><hr/>${rows}</div>`;
 };
 
 const getArrowProjectKey = (file: File) => `${ARROW_STORAGE_PREFIX}:${file.name}:${file.size}`;
@@ -192,28 +234,17 @@ const buildArrowGeoJson = (
 
     const lastPoint = arrow.points[arrow.points.length - 1];
     const previousPoint = arrow.points[arrow.points.length - 2];
-
     const headLines = getArrowHeadLines(previousPoint, lastPoint);
 
     return [
       {
         type: "Feature" as const,
-        geometry: {
-          type: "LineString" as const,
-          coordinates: arrow.points,
-        },
-        properties: {
-          id: arrow.id,
-          kind: "arrow-line",
-          label: arrow.label,
-        },
+        geometry: { type: "LineString" as const, coordinates: arrow.points },
+        properties: { id: arrow.id, kind: "arrow-line", label: arrow.label },
       },
       ...headLines.map((coordinates, headIndex) => ({
         type: "Feature" as const,
-        geometry: {
-          type: "LineString" as const,
-          coordinates,
-        },
+        geometry: { type: "LineString" as const, coordinates },
         properties: {
           id: `${arrow.id}-head-${headIndex}`,
           kind: "arrow-head",
@@ -237,11 +268,7 @@ const addArrowLayers = (map: maplibregl.Map, arrows: ArrowAnnotation[]) => {
     type: "line",
     source: ARROW_SOURCE_ID,
     filter: ["==", ["get", "kind"], "arrow-line"],
-    paint: {
-      "line-color": "#facc15",
-      "line-width": 4,
-      "line-opacity": 0.95,
-    },
+    paint: { "line-color": "#facc15", "line-width": 4, "line-opacity": 0.95 },
   });
 
   map.addLayer({
@@ -249,20 +276,15 @@ const addArrowLayers = (map: maplibregl.Map, arrows: ArrowAnnotation[]) => {
     type: "line",
     source: ARROW_SOURCE_ID,
     filter: ["==", ["get", "kind"], "arrow-head"],
-    paint: {
-      "line-color": "#facc15",
-      "line-width": 4,
-      "line-opacity": 0.95,
-    },
-    layout: {
-      "line-cap": "round",
-      "line-join": "round",
-    },
+    paint: { "line-color": "#facc15", "line-width": 4, "line-opacity": 0.95 },
+    layout: { "line-cap": "round", "line-join": "round" },
   });
 };
 
 const MapGlobeShp = () => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const layerSearchRef = useRef<HTMLInputElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const popupLayerIdsRef = useRef<Set<string>>(new Set());
   const projectKeyRef = useRef("");
@@ -272,7 +294,9 @@ const MapGlobeShp = () => {
 
   const [shapeLayers, setShapeLayers] = useState<ShapeLayer[]>([]);
   const [selectedLayerId, setSelectedLayerId] = useState<string>("");
+  const [layerSearch, setLayerSearch] = useState("");
   const [featureSearch, setFeatureSearch] = useState("");
+  const [mobilePanel, setMobilePanel] = useState<"layers" | "features">("layers");
   const [openingLayerId, setOpeningLayerId] = useState<string>("");
   const [projectKey, setProjectKey] = useState("");
   const [arrowAnnotations, setArrowAnnotations] = useState<ArrowAnnotation[]>([]);
@@ -280,8 +304,18 @@ const MapGlobeShp = () => {
   const [draftArrowPoints, setDraftArrowPoints] = useState<LngLatTuple[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [loadStage, setLoadStage] = useState<LoadStage | null>(null);
   const [statusText, setStatusText] = useState("");
   const [tourStep, setTourStep] = useState<number | null>(null);
+
+  useEffect(() => {
+    Object.keys(localStorage)
+      .filter(
+        (key) =>
+          key.startsWith(LEGACY_ARROW_STORAGE_PREFIX) && !key.startsWith(ARROW_STORAGE_PREFIX),
+      )
+      .forEach((key) => localStorage.removeItem(key));
+  }, []);
 
   useEffect(() => {
     projectKeyRef.current = projectKey;
@@ -298,6 +332,28 @@ const MapGlobeShp = () => {
   useEffect(() => {
     draftArrowPointsRef.current = draftArrowPoints;
   }, [draftArrowPoints]);
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTyping = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA";
+
+      if (event.key === "/" && shapeLayers.length > 0 && !isTyping) {
+        event.preventDefault();
+        setMobilePanel("layers");
+        layerSearchRef.current?.focus();
+      }
+
+      if (event.key === "Escape" && isDrawingArrowRef.current) {
+        setIsDrawingArrow(false);
+        setDraftArrowPoints([]);
+        setStatusText("ยกเลิกการวาดลูกศรแล้ว");
+      }
+    };
+
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [shapeLayers.length]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -373,74 +429,6 @@ const MapGlobeShp = () => {
     return nextPoints;
   }, []);
 
-  const setAndSaveArrows = (nextArrows: ArrowAnnotation[]) => {
-    setArrowAnnotations(nextArrows);
-    saveArrows(projectKeyRef.current, nextArrows);
-  };
-
-  const handleToggleArrowDrawing = () => {
-    const nextDrawing = !isDrawingArrow;
-    setIsDrawingArrow(nextDrawing);
-    setDraftArrowPoints([]);
-    setStatusText(
-      nextDrawing
-        ? "โหมดวาดลูกศร: คลิก 1 ครั้งเพื่อเริ่ม ลากตามแนว แล้วดับเบิลคลิกเพื่อจบ"
-        : "ปิดโหมดวาดลูกศร",
-    );
-  };
-
-  const handleFinishArrow = () => {
-    if (draftArrowPoints.length < 2) {
-      setStatusText("ต้องมีอย่างน้อย 2 จุดก่อนจบลูกศร");
-      return;
-    }
-
-    const nextArrows = [
-      ...arrowAnnotations,
-      {
-        id: `arrow-${Date.now()}`,
-        points: draftArrowPoints,
-        label: `Arrow ${arrowAnnotations.length + 1}`,
-      },
-    ];
-
-    setAndSaveArrows(nextArrows);
-    setDraftArrowPoints([]);
-    draftArrowPointsRef.current = [];
-    setStatusText(`บันทึกลูกศรแล้ว ${draftArrowPoints.length} จุด`);
-  };
-
-  const handleUndoDraftPoint = () => {
-    const nextPoints = draftArrowPoints.slice(0, -1);
-    setDraftArrowPoints(nextPoints);
-    draftArrowPointsRef.current = nextPoints;
-    setStatusText(
-      nextPoints.length
-        ? `ลบจุดล่าสุดแล้ว เหลือ ${nextPoints.length} จุด`
-        : "ลบจุดร่างทั้งหมดแล้ว",
-    );
-  };
-
-  const handleUndoArrow = () => {
-    const nextArrows = arrowAnnotations.slice(0, -1);
-    setAndSaveArrows(nextArrows);
-    setDraftArrowPoints([]);
-    draftArrowPointsRef.current = [];
-    setStatusText(
-      nextArrows.length
-        ? `ลบลูกศรล่าสุดแล้ว เหลือ ${nextArrows.length} อัน`
-        : "ลบลูกศรล่าสุดแล้ว",
-    );
-  };
-
-  const handleClearSavedArrows = () => {
-    setArrowAnnotations([]);
-    setDraftArrowPoints([]);
-    draftArrowPointsRef.current = [];
-    if (projectKeyRef.current) localStorage.removeItem(projectKeyRef.current);
-    setStatusText("ลบลูกศรของไฟล์นี้แล้ว");
-  };
-
   const zoomToFeatures = (features: GeoJsonFeature[]) => {
     if (!mapRef.current || features.length === 0) return;
 
@@ -456,7 +444,7 @@ const MapGlobeShp = () => {
     }
   };
 
-  const zoomToFeature = (geometry: GeoJSON.Geometry) => {
+  const zoomToFeature = (geometry: GeoJSON.Geometry | null | undefined) => {
     if (!mapRef.current) return;
 
     const bounds = new maplibregl.LngLatBounds();
@@ -612,31 +600,37 @@ const MapGlobeShp = () => {
 
   const openLayer = async (layer: ShapeLayer, shouldZoom: boolean) => {
     setOpeningLayerId(layer.id);
-    setStatusText(`กำลังเปิด layer: ${layer.name}...`);
-    await waitForPaint();
+    setStatusText(`กำลังเปิดชั้นข้อมูล: ${layer.name}...`);
+    try {
+      await waitForPaint();
 
-    if (!layer.loaded) {
-      addLayerToMap({ ...layer, visible: true });
-    } else {
-      setMapLayerVisibility(layer, true);
+      if (!layer.loaded) {
+        addLayerToMap({ ...layer, visible: true });
+      } else {
+        setMapLayerVisibility(layer, true);
+      }
+
+      setShapeLayers((current) =>
+        current.map((item) =>
+          item.id === layer.id ? { ...item, loaded: true, visible: true } : item,
+        ),
+      );
+
+      if (shouldZoom && layer.count <= AUTO_ZOOM_FEATURE_LIMIT) {
+        zoomToFeatures(layer.features);
+      }
+
+      setStatusText(
+        layer.count > AUTO_ZOOM_FEATURE_LIMIT
+          ? `เปิดชั้นข้อมูลแล้ว: ${layer.name} เลือกรายการเพื่อซูม`
+          : `เปิดชั้นข้อมูลแล้ว: ${layer.name}`,
+      );
+    } catch (error) {
+      console.error(error);
+      setStatusText(`เปิดชั้นข้อมูลไม่สำเร็จ: ${layer.name}`);
+    } finally {
+      setOpeningLayerId("");
     }
-
-    setShapeLayers((current) =>
-      current.map((item) =>
-        item.id === layer.id ? { ...item, loaded: true, visible: true } : item,
-      ),
-    );
-
-    if (shouldZoom && layer.count <= AUTO_ZOOM_FEATURE_LIMIT) {
-      zoomToFeatures(layer.features);
-    }
-
-    setOpeningLayerId("");
-    setStatusText(
-      layer.count > AUTO_ZOOM_FEATURE_LIMIT
-        ? `เปิด layer แล้ว: ${layer.name} - เลือกรายการตำแหน่งเพื่อซูม`
-        : `เปิด layer แล้ว: ${layer.name}`,
-    );
   };
 
   const toggleLayer = async (layerId: string) => {
@@ -649,7 +643,7 @@ const MapGlobeShp = () => {
       return;
     }
 
-    setStatusText(`ปิด layer แล้ว: ${layer.name}`);
+    setStatusText(`ปิดชั้นข้อมูลแล้ว: ${layer.name}`);
     setMapLayerVisibility(layer, false);
     setShapeLayers((current) =>
       current.map((item) =>
@@ -660,8 +654,18 @@ const MapGlobeShp = () => {
 
   const showFeatureOnMap = async (layer: ShapeLayer, feature: GeoJsonFeature) => {
     if (openingLayerId) return;
+    if (!feature.geometry) {
+      setStatusText("รายการนี้ไม่มีพิกัด จึงไม่สามารถแสดงบนแผนที่ได้");
+      return;
+    }
     if (!layer.visible) await openLayer(layer, false);
     zoomToFeature(feature.geometry);
+  };
+
+  const hideAllLayers = () => {
+    shapeLayers.forEach((layer) => setMapLayerVisibility(layer, false));
+    setShapeLayers((current) => current.map((layer) => ({ ...layer, visible: false })));
+    setStatusText("ปิดชั้นข้อมูลทั้งหมดแล้ว");
   };
 
   const readZipFile = (file: File) =>
@@ -671,7 +675,7 @@ const MapGlobeShp = () => {
       reader.onprogress = (event) => {
         if (!event.lengthComputable) return;
         const percent = Math.round((event.loaded / event.total) * 100);
-        setUploadProgress(percent);
+        setUploadProgress(Math.round(percent / 3));
         setStatusText(`กำลังอ่านไฟล์ ${percent}%`);
       };
 
@@ -680,26 +684,121 @@ const MapGlobeShp = () => {
       reader.readAsArrayBuffer(file);
     });
 
+  const parseShapeInWorker = (buffer: ArrayBuffer) =>
+    new Promise<ParsedShapeCollection[]>((resolve, reject) => {
+      const collections: ParsedShapeCollection[] = [];
+      let activeCollection: ParsedShapeCollection | null = null;
+      const worker = new Worker(new URL("../workers/shapefile.worker.ts", import.meta.url), {
+        type: "module",
+      });
+
+      worker.onmessage = (
+        event: MessageEvent<
+          | { type: "start"; total: number; uncompressedBytes: number }
+          | { type: "progress"; current: number; total: number; message: string }
+          | {
+              type: "layer-start";
+              current: number;
+              total: number;
+              fileName: string;
+              featureCount: number;
+              detailLimited: boolean;
+            }
+          | {
+              type: "feature-chunk";
+              current: number;
+              total: number;
+              loadedFeatures: number;
+              featureCount: number;
+              features: GeoJsonFeature[];
+            }
+          | {
+              type: "layer-complete";
+              current: number;
+              total: number;
+              geometryTypes: string[];
+            }
+          | { type: "complete" }
+          | { type: "error"; message: string }
+        >,
+      ) => {
+        if (event.data.type === "start") {
+          setStatusText(`พบ ${event.data.total} ชั้นข้อมูล กำลังแปลงทีละชั้น...`);
+          return;
+        }
+
+        if (event.data.type === "progress") {
+          setUploadProgress(34 + Math.round((event.data.current / event.data.total) * 40));
+          setStatusText(event.data.message);
+          return;
+        }
+
+        if (event.data.type === "layer-start") {
+          activeCollection = {
+            fileName: event.data.fileName,
+            geometryTypes: [],
+            features: [],
+            featureCount: event.data.featureCount,
+            detailLimited: event.data.detailLimited,
+          };
+          return;
+        }
+
+        if (event.data.type === "feature-chunk") {
+          activeCollection?.features.push(...event.data.features);
+          setStatusText(
+            `ชั้น ${event.data.current}/${event.data.total}: รับข้อมูล ${event.data.loadedFeatures.toLocaleString()}/${event.data.featureCount.toLocaleString()} รายการ`,
+          );
+          return;
+        }
+
+        if (event.data.type === "layer-complete") {
+          if (activeCollection) {
+            activeCollection.geometryTypes = event.data.geometryTypes;
+            collections.push(activeCollection);
+          }
+          activeCollection = null;
+          setStatusText(`แปลงแล้ว ${event.data.current}/${event.data.total} ชั้นข้อมูล`);
+          return;
+        }
+
+        worker.terminate();
+        if (event.data.type === "complete") {
+          resolve(collections);
+        } else {
+          reject(new Error(event.data.message));
+        }
+      };
+
+      worker.onerror = (event) => {
+        worker.terminate();
+        reject(new Error(event.message || "Web Worker ทำงานไม่สำเร็จ"));
+      };
+
+      worker.postMessage({ buffer }, [buffer]);
+    });
+
   const loadShapeBuffer = async (buffer: ArrayBuffer, label: string, nextProjectKey: string) => {
     if (!mapRef.current) return;
 
     setIsLoading(true);
-    setUploadProgress(100);
-    setStatusText(`กำลังแปลงไฟล์ ${label}...`);
+    setLoadStage({ current: 2, total: 3, label: "แปลง Shapefile" });
+    setUploadProgress(34);
+    setStatusText(`กำลังแปลงไฟล์ ${label} ในเบื้องหลัง หน้ายังใช้งานได้`);
     await waitForPaint();
 
     try {
       clearLoadedLayers();
-      const result: any = await shp(buffer);
-      const collections = Array.isArray(result) ? result : [result];
+      const collections = await parseShapeInWorker(buffer);
+      setLoadStage({ current: 3, total: 3, label: "เตรียมชั้นข้อมูล" });
+      setUploadProgress(75);
+      setStatusText("กำลังเตรียมรายการชั้นข้อมูล...");
+      await waitForPaint();
       const savedArrows = loadSavedArrows(nextProjectKey);
 
-      const nextLayers: ShapeLayer[] = collections.map((collection: any, index: number) => {
+      const nextLayers: ShapeLayer[] = collections.map((collection, index) => {
         const id = `shape-${index}`;
-        const features = (collection.features || []) as GeoJsonFeature[];
-        const geometryTypes = Array.from(
-          new Set(features.map((feature) => feature.geometry?.type).filter(Boolean)),
-        );
+        const features = collection.features || [];
 
         return {
           id,
@@ -710,11 +809,12 @@ const MapGlobeShp = () => {
           pointLayerId: `${id}-point`,
           name: getDisplayName(collection.fileName || label, index),
           color: LAYER_COLORS[index % LAYER_COLORS.length],
-          count: features.length,
-          geometryTypes,
+          count: collection.featureCount,
+          geometryTypes: collection.geometryTypes,
           features,
           loaded: false,
           visible: false,
+          detailLimited: collection.detailLimited,
         };
       });
 
@@ -722,19 +822,26 @@ const MapGlobeShp = () => {
       setSelectedLayerId(nextLayers[0]?.id || "");
       setProjectKey(nextProjectKey);
       setArrowAnnotations(savedArrows);
+      setLayerSearch("");
       setFeatureSearch("");
+      setMobilePanel("layers");
+      setUploadProgress(100);
       setStatusText(
-        `อ่านไฟล์แล้ว ${nextLayers.length} layer - ปิดไว้ทั้งหมด${
-          savedArrows.length ? ` | โหลดลูกศร ${savedArrows.length} อัน` : ""
+        `อ่านไฟล์แล้ว ${nextLayers.length} ชั้นข้อมูล ปิดไว้ทั้งหมด${
+          savedArrows.length ? ` โหลดลูกศร ${savedArrows.length} อัน` : ""
         }`,
       );
     } catch (err) {
       console.error(err);
-      setStatusText("ไฟล์เสีย หรือโครงสร้าง Zip ไม่ถูกต้อง");
-      alert("ไฟล์เสีย หรือโครงสร้าง Zip ไม่ถูกต้อง");
+      setStatusText(
+        err instanceof Error
+          ? err.message
+          : "เปิดไฟล์ไม่สำเร็จ กรุณาตรวจว่า ZIP มีไฟล์ .shp, .dbf และ .shx ที่ใช้ชื่อเดียวกัน",
+      );
     } finally {
       setIsLoading(false);
       setUploadProgress(null);
+      setLoadStage(null);
     }
   };
 
@@ -744,13 +851,15 @@ const MapGlobeShp = () => {
     const nextProjectKey = getArrowProjectKey(file);
     setIsLoading(true);
     setUploadProgress(0);
+    setLoadStage({ current: 1, total: 3, label: "อ่านไฟล์ ZIP" });
     try {
       await loadShapeBuffer(await readZipFile(file), file.name, nextProjectKey);
     } catch (err) {
       console.error(err);
-      setStatusText("อ่านไฟล์ไม่สำเร็จ");
+      setStatusText(err instanceof Error ? err.message : "อ่านไฟล์ไม่สำเร็จ");
       setIsLoading(false);
       setUploadProgress(null);
+      setLoadStage(null);
     } finally {
       e.target.value = "";
     }
@@ -765,10 +874,17 @@ const MapGlobeShp = () => {
     setIsDrawingArrow(false);
     setDraftArrowPoints([]);
     draftArrowPointsRef.current = [];
+    setLayerSearch("");
     setFeatureSearch("");
     setOpeningLayerId("");
     setUploadProgress(null);
+    setLoadStage(null);
     setStatusText("");
+  };
+
+  const handleClearWithConfirmation = () => {
+    if (!window.confirm("ล้างชั้นข้อมูลและลูกศรทั้งหมดออกจากหน้าจอหรือไม่?")) return;
+    handleClear();
   };
 
   useEffect(() => {
@@ -788,6 +904,11 @@ const MapGlobeShp = () => {
           },
         },
         layers: [{ id: "google-layer", type: "raster", source: "google" }],
+      },
+      locale: {
+        "NavigationControl.ZoomIn": "ขยายแผนที่",
+        "NavigationControl.ZoomOut": "ย่อแผนที่",
+        "NavigationControl.ResetBearing": "หันแผนที่กลับทิศเหนือ",
       },
       center: [100.5, 13.7],
       zoom: 1.5,
@@ -859,6 +980,11 @@ const MapGlobeShp = () => {
   }, [appendDraftPoint]);
 
   const selectedLayer = shapeLayers.find((layer) => layer.id === selectedLayerId);
+  const filteredLayers = useMemo(() => {
+    const search = layerSearch.trim().toLowerCase();
+    if (!search) return shapeLayers;
+    return shapeLayers.filter((layer) => layer.name.toLowerCase().includes(search));
+  }, [layerSearch, shapeLayers]);
   const activeTourStep = tourStep === null ? null : TOUR_STEPS[tourStep];
   const activeTourIndex = tourStep ?? 0;
   const selectedFeatureItems = useMemo(() => {
@@ -895,135 +1021,139 @@ const MapGlobeShp = () => {
 
   return (
     <div style={pageStyle}>
-      <button onClick={handleResetToGlobe} style={resetGlobeButtonStyle} title="Back to Globe View">
+      <button
+        aria-label="กลับไปมุมมองรูปโลก"
+        onClick={handleResetToGlobe}
+        style={resetGlobeButtonStyle}
+        title="กลับไปมุมมองรูปโลก"
+      >
         🌎
       </button>
 
-      <div style={leftStackStyle}>
+      <div className="left-stack" style={leftStackStyle}>
         <div
+          className={`upload-panel ${shapeLayers.length > 0 ? "has-data" : ""}`}
           style={{
             ...panelStyle,
             ...(activeTourStep?.target === "upload" ? tourHighlightStyle : null),
           }}
         >
-          <strong style={{ fontSize: 13 }}>SHP Layers</strong>
           <input
+            ref={fileInputRef}
+            aria-hidden="true"
+            tabIndex={-1}
             type="file"
             accept=".zip"
             onChange={handleFileUpload}
             disabled={isLoading}
-            style={{ fontSize: 11, marginTop: 8, width: "100%" }}
+            style={hiddenFileInputStyle}
           />
+          {shapeLayers.length === 0 ? (
+            <>
+              <div style={emptyStateTitleStyle}>เปิดดูข้อมูลแผนที่</div>
+              <div style={emptyStateBodyStyle}>
+                เลือกไฟล์ Shapefile แบบ ZIP เพื่อดูชั้นข้อมูลและตำแหน่งบนแผนที่
+              </div>
+              <button
+                className="ui-button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isLoading}
+                style={{
+                  ...primaryUploadButtonStyle,
+                  cursor: isLoading ? "wait" : "pointer",
+                  opacity: isLoading ? 0.72 : 1,
+                }}
+              >
+                {isLoading ? "กำลังอ่านไฟล์..." : "เลือกไฟล์แผนที่ (.zip)"}
+              </button>
+              <div style={uploadHintStyle}>ไฟล์ควรมี .shp, .dbf, .shx และ .prj</div>
+            </>
+          ) : (
+            <div style={loadedFileHeaderStyle}>
+              <div>
+                <div style={loadedFileTitleStyle}>ชั้นข้อมูลพร้อมใช้งาน</div>
+                <div style={loadedFileMetaStyle}>{shapeLayers.length.toLocaleString()} ชั้นข้อมูล</div>
+              </div>
+              <button
+                className="ui-button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isLoading}
+                style={secondaryButtonStyle}
+              >
+                เปลี่ยนไฟล์
+              </button>
+            </div>
+          )}
           {uploadProgress !== null && (
             <div style={progressWrapStyle}>
               <div style={progressTrackStyle}>
-                <div style={{ ...progressBarStyle, width: `${uploadProgress}%` }} />
+                <div
+                  style={{
+                    ...progressBarStyle,
+                    transform: `scaleX(${uploadProgress / 100})`,
+                  }}
+                />
               </div>
               <div style={progressTextStyle}>{uploadProgress}%</div>
             </div>
           )}
-          {statusText && <div style={statusStyle}>{statusText}</div>}
-          <button onClick={() => setTourStep(0)} style={tourStartButtonStyle}>
-            เริ่มทัวร์
-          </button>
-          <div style={arrowToolWrapStyle}>
-            <button
-              onClick={handleToggleArrowDrawing}
-              disabled={!shapeLayers.length}
-              style={{
-                ...arrowToolButtonStyle,
-                background: isDrawingArrow ? "#facc15" : "#0f172a",
-                color: isDrawingArrow ? "#111827" : "#e5e7eb",
-                cursor: shapeLayers.length ? "pointer" : "not-allowed",
-              }}
-            >
-              {isDrawingArrow ? "กำลังวาดลูกศร" : "วาดลูกศร"}
-            </button>
-            <button
-              onClick={handleUndoArrow}
-              disabled={!arrowAnnotations.length}
-              style={{
-                ...arrowToolButtonStyle,
-                background: "#334155",
-                cursor: arrowAnnotations.length ? "pointer" : "not-allowed",
-              }}
-            >
-              ย้อนลูกศร
-            </button>
-            <button
-              onClick={handleClearSavedArrows}
-              disabled={!arrowAnnotations.length}
-              style={{
-                ...arrowToolButtonStyle,
-                background: "#7f1d1d",
-                cursor: arrowAnnotations.length ? "pointer" : "not-allowed",
-              }}
-            >
-              ลบลูกศร
-            </button>
-          </div>
-          {isDrawingArrow && (
-            <div style={arrowToolWrapStyle}>
-              <button
-                onClick={handleFinishArrow}
-                disabled={draftArrowPoints.length < 2}
-                style={{
-                  ...arrowToolButtonStyle,
-                  background: "#0891b2",
-                  cursor: draftArrowPoints.length >= 2 ? "pointer" : "not-allowed",
-                }}
-              >
-                จบตอนนี้
-              </button>
-              <button
-                onClick={handleUndoDraftPoint}
-                disabled={!draftArrowPoints.length}
-                style={{
-                  ...arrowToolButtonStyle,
-                  background: "#475569",
-                  cursor: draftArrowPoints.length ? "pointer" : "not-allowed",
-                }}
-              >
-                ย้อนจุด
-              </button>
-              <button
-                onClick={() => {
-                  setDraftArrowPoints([]);
-                  setStatusText("ล้างจุดที่กำลังร่างแล้ว");
-                }}
-                disabled={!draftArrowPoints.length}
-                style={{
-                  ...arrowToolButtonStyle,
-                  background: "#1f2937",
-                  cursor: draftArrowPoints.length ? "pointer" : "not-allowed",
-                }}
-              >
-                ล้างร่าง
-              </button>
+          {loadStage && (
+            <div style={loadStageStyle}>
+              ขั้นตอน {loadStage.current}/{loadStage.total}: {loadStage.label}
             </div>
           )}
-          <div style={arrowToolHintStyle}>
-            ลูกศร {arrowAnnotations.length} อัน
-            {projectKey ? " | บันทึกในเครื่องตามไฟล์นี้" : " | อัปโหลดไฟล์ก่อน"}
-            {isDrawingArrow && !draftArrowPoints.length ? " | คลิกบนแผนที่เพื่อเริ่ม" : ""}
-            {draftArrowPoints.length
-              ? ` | ร่างอยู่ ${draftArrowPoints.length} จุด ดับเบิลคลิกเพื่อจบ`
-              : ""}
-          </div>
+          {statusText && (
+            <div aria-live="polite" style={statusStyle}>
+              {statusText}
+            </div>
+          )}
+          {shapeLayers.length > 0 && (
+            <button className="text-button" onClick={() => setTourStep(0)} style={helpButtonStyle}>
+              ดูวิธีใช้งาน
+            </button>
+          )}
         </div>
 
         {shapeLayers.length > 0 && (
           <div
+            className={`layer-panel ${mobilePanel === "layers" ? "mobile-panel-active" : ""}`}
             style={{
               ...listContainerStyle,
               ...(activeTourStep?.target === "layers" ? tourHighlightStyle : null),
             }}
           >
-            <div style={listTitleStyle}>Layers ({shapeLayers.length})</div>
-            <div style={layerListStyle}>
-              {shapeLayers.map((layer) => (
+            <div style={listHeaderStyle}>
+              <div style={{ ...listTitleStyle, marginBottom: 0 }}>
+                ชั้นข้อมูล ({shapeLayers.length})
+              </div>
+              <button
+                className="compact-action"
+                onClick={hideAllLayers}
+                disabled={!shapeLayers.some((layer) => layer.visible)}
+                style={compactButtonStyle}
+              >
+                ปิดทั้งหมด
+              </button>
+            </div>
+            <label style={fieldLabelStyle} htmlFor="layer-search">
+              ค้นหาชั้นข้อมูล{" "}
+              <span className="shortcut-hint" style={shortcutHintStyle}>
+                กด /
+              </span>
+            </label>
+            <input
+              ref={layerSearchRef}
+              id="layer-search"
+              value={layerSearch}
+              onChange={(event) => setLayerSearch(event.target.value)}
+              placeholder="พิมพ์ชื่อชั้นข้อมูล"
+              style={featureSearchStyle}
+            />
+            <div className="layer-list scroll-region" style={layerListStyle}>
+              {filteredLayers.map((layer) => (
                 <div key={layer.id} style={layerRowStyle}>
                   <button
+                    className="layer-toggle"
                     onClick={() => toggleLayer(layer.id)}
                     disabled={Boolean(openingLayerId)}
                     style={{
@@ -1037,29 +1167,41 @@ const MapGlobeShp = () => {
                       color: openingLayerId === layer.id || layer.visible ? "#041015" : "#e5e7eb",
                       cursor: openingLayerId ? "wait" : "pointer",
                     }}
-                    title={layer.visible ? "ปิด layer" : "เปิด layer"}
+                    aria-label={`${layer.visible ? "ปิด" : "เปิด"}ชั้นข้อมูล ${layer.name}`}
+                    title={layer.visible ? "ปิดชั้นข้อมูล" : "เปิดชั้นข้อมูล"}
                   >
-                    {openingLayerId === layer.id ? "..." : layer.visible ? "ON" : "OFF"}
+                      {openingLayerId === layer.id ? "..." : layer.visible ? "เปิด" : "ปิด"}
                   </button>
                   <button
+                    className={`layer-name ${selectedLayerId === layer.id ? "is-selected" : ""}`}
+                    aria-pressed={selectedLayerId === layer.id}
                     onClick={() => {
                       setSelectedLayerId(layer.id);
                       setFeatureSearch("");
+                      setMobilePanel("features");
                     }}
                     style={{
                       ...layerNameButtonStyle,
-                      borderColor: selectedLayerId === layer.id ? layer.color : "transparent",
+                      borderColor: selectedLayerId === layer.id ? "#67e8f9" : "transparent",
                     }}
                   >
                     <span style={{ color: layer.color }}>{layer.name}</span>
                     <small style={layerMetaStyle}>
-                      {layer.count.toLocaleString()} items | {layer.geometryTypes.join(", ")}
+                      {layer.count.toLocaleString()} รายการ |{" "}
+                      {layer.geometryTypes.map((type) => GEOMETRY_LABELS[type] || type).join(", ")}
                     </small>
                   </button>
                 </div>
               ))}
             </div>
-            <button onClick={handleClear} style={clearButtonStyle}>
+            {filteredLayers.length === 0 && (
+              <div style={featureHintStyle}>ไม่พบชั้นข้อมูลที่ค้นหา</div>
+            )}
+            <button
+              className="ui-button danger-button"
+              onClick={handleClearWithConfirmation}
+              style={clearButtonStyle}
+            >
               ล้างข้อมูล
             </button>
           </div>
@@ -1068,22 +1210,32 @@ const MapGlobeShp = () => {
 
       {selectedLayer && (
         <div
+          className={`feature-panel ${mobilePanel === "features" ? "mobile-panel-active" : ""}`}
           style={{
             ...featurePanelStyle,
             ...(activeTourStep?.target === "features" ? tourHighlightStyle : null),
           }}
         >
-          <div style={listTitleStyle}>รายการตำแหน่ง</div>
+          <div style={listTitleStyle}>รายการข้อมูล</div>
           <div style={selectedLayerNameStyle}>
             <span style={{ color: selectedLayer.color }}>{selectedLayer.name}</span>
-            <small>{selectedLayer.count.toLocaleString()} items</small>
+            <small>{selectedLayer.count.toLocaleString()} รายการ</small>
           </div>
+          <label style={fieldLabelStyle} htmlFor="feature-search">
+            ค้นหารายการ
+          </label>
           <input
+            id="feature-search"
             value={featureSearch}
             onChange={(event) => setFeatureSearch(event.target.value)}
             placeholder="ค้นหาชื่อ / id"
             style={featureSearchStyle}
           />
+          {selectedLayer.detailLimited && (
+            <div style={featureHintStyle}>
+              ชั้นข้อมูลขนาดใหญ่มาก ระบบรวมรูปทรงเป็นชุดเพื่อลดการใช้หน่วยความจำ
+            </div>
+          )}
           {selectedLayer.count > selectedFeatureItems.length && (
             <div style={featureHintStyle}>
               {selectedLayer.count > LARGE_SEARCH_FEATURE_LIMIT &&
@@ -1094,9 +1246,10 @@ const MapGlobeShp = () => {
                   }`}
             </div>
           )}
-          <div style={featureListStyle}>
+          <div className="feature-list scroll-region" style={featureListStyle}>
             {selectedFeatureItems.map(({ feature, index, name }) => (
               <button
+                className="feature-item"
                 key={`${selectedLayer.id}-${index}`}
                 onClick={() => showFeatureOnMap(selectedLayer, feature)}
                 style={featureButtonStyle}
@@ -1109,6 +1262,25 @@ const MapGlobeShp = () => {
             )}
           </div>
         </div>
+      )}
+
+      {shapeLayers.length > 0 && (
+        <nav className="mobile-panel-switcher" aria-label="เลือกแผงข้อมูล">
+          <button
+            className="mobile-tab"
+            aria-pressed={mobilePanel === "layers"}
+            onClick={() => setMobilePanel("layers")}
+          >
+            ชั้นข้อมูล
+          </button>
+          <button
+            className="mobile-tab"
+            aria-pressed={mobilePanel === "features"}
+            onClick={() => setMobilePanel("features")}
+          >
+            รายการข้อมูล
+          </button>
+        </nav>
       )}
 
       {activeTourStep && (
@@ -1167,6 +1339,7 @@ const pageStyle: React.CSSProperties = {
 const leftStackStyle: React.CSSProperties = {
   position: "absolute",
   top: 10,
+  bottom: 10,
   left: 10,
   zIndex: 10,
   display: "flex",
@@ -1174,15 +1347,97 @@ const leftStackStyle: React.CSSProperties = {
   gap: 10,
   width: 340,
   maxWidth: "calc(100vw - 20px)",
+  minHeight: 0,
 };
 
 const panelStyle: React.CSSProperties = {
   background: "#fff",
-  padding: "12px 14px",
+  padding: 16,
   borderRadius: 8,
   width: "100%",
   boxSizing: "border-box",
   boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+  fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+};
+
+const hiddenFileInputStyle: React.CSSProperties = {
+  display: "none",
+};
+
+const emptyStateTitleStyle: React.CSSProperties = {
+  color: "#0f172a",
+  fontSize: 18,
+  fontWeight: 800,
+  lineHeight: 1.3,
+};
+
+const emptyStateBodyStyle: React.CSSProperties = {
+  marginTop: 6,
+  color: "#475569",
+  fontSize: 13,
+  lineHeight: 1.55,
+};
+
+const primaryUploadButtonStyle: React.CSSProperties = {
+  width: "100%",
+  minHeight: 44,
+  marginTop: 14,
+  padding: "10px 14px",
+  color: "#fff",
+  background: "#0f766e",
+  border: "none",
+  borderRadius: 7,
+  fontSize: 14,
+  fontWeight: 750,
+};
+
+const uploadHintStyle: React.CSSProperties = {
+  marginTop: 8,
+  color: "#64748b",
+  fontSize: 11,
+  lineHeight: 1.45,
+};
+
+const helpButtonStyle: React.CSSProperties = {
+  marginTop: 10,
+  padding: 0,
+  color: "#0f766e",
+  background: "transparent",
+  border: "none",
+  cursor: "pointer",
+  fontSize: 12,
+  fontWeight: 700,
+};
+
+const loadedFileHeaderStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 12,
+};
+
+const loadedFileTitleStyle: React.CSSProperties = {
+  color: "#0f172a",
+  fontSize: 14,
+  fontWeight: 800,
+};
+
+const loadedFileMetaStyle: React.CSSProperties = {
+  marginTop: 2,
+  color: "#64748b",
+  fontSize: 11,
+};
+
+const secondaryButtonStyle: React.CSSProperties = {
+  minHeight: 36,
+  padding: "7px 10px",
+  color: "#0f172a",
+  background: "#e2e8f0",
+  border: "none",
+  borderRadius: 6,
+  cursor: "pointer",
+  fontSize: 12,
+  fontWeight: 700,
 };
 
 const progressWrapStyle: React.CSSProperties = {
@@ -1204,7 +1459,8 @@ const progressBarStyle: React.CSSProperties = {
   height: "100%",
   background: "#0891b2",
   borderRadius: 999,
-  transition: "width 120ms ease",
+  transformOrigin: "left center",
+  transition: "transform 160ms ease-out",
 };
 
 const progressTextStyle: React.CSSProperties = {
@@ -1221,51 +1477,20 @@ const statusStyle: React.CSSProperties = {
   lineHeight: 1.4,
 };
 
-const tourStartButtonStyle: React.CSSProperties = {
-  width: "100%",
-  marginTop: 10,
-  padding: "8px 10px",
-  background: "#111827",
-  color: "#fff",
-  border: "none",
-  borderRadius: 6,
-  cursor: "pointer",
-  fontSize: 12,
-  fontWeight: 700,
-};
-
-const arrowToolWrapStyle: React.CSSProperties = {
-  display: "grid",
-  gridTemplateColumns: "1fr 1fr 1fr",
-  gap: 6,
-  marginTop: 8,
-};
-
-const arrowToolButtonStyle: React.CSSProperties = {
-  minHeight: 34,
-  padding: "7px 8px",
-  color: "#fff",
-  border: "none",
-  borderRadius: 6,
-  fontSize: 11,
-  fontWeight: 800,
-};
-
-const arrowToolHintStyle: React.CSSProperties = {
-  marginTop: 8,
-  color: "#475569",
-  fontSize: 11,
-  lineHeight: 1.35,
-};
-
 const listContainerStyle: React.CSSProperties = {
-  background: "rgba(10, 10, 10, 0.9)",
+  display: "flex",
+  flexDirection: "column",
+  flex: "1 1 auto",
+  minHeight: 0,
+  overflow: "hidden",
+  background: "rgba(8, 15, 28, 0.97)",
   color: "#fff",
   padding: 12,
   borderRadius: 8,
   width: "100%",
   boxSizing: "border-box",
-  border: "1px solid #333",
+  border: "1px solid #475569",
+  boxShadow: "0 4px 8px rgba(0,0,0,0.42)",
 };
 
 const listTitleStyle: React.CSSProperties = {
@@ -1275,8 +1500,41 @@ const listTitleStyle: React.CSSProperties = {
   fontWeight: 700,
 };
 
+const loadStageStyle: React.CSSProperties = {
+  marginTop: 5,
+  color: "#334155",
+  fontSize: 11,
+  fontWeight: 700,
+};
+
+const listHeaderStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: 8,
+  marginBottom: 10,
+};
+
+const compactButtonStyle: React.CSSProperties = {
+  minHeight: 32,
+  padding: "5px 8px",
+  color: "#cbd5e1",
+  background: "#1e293b",
+  border: "none",
+  borderRadius: 5,
+  cursor: "pointer",
+  fontSize: 11,
+  fontWeight: 700,
+};
+
+const shortcutHintStyle: React.CSSProperties = {
+  color: "#94a3b8",
+  fontWeight: 500,
+};
+
 const layerListStyle: React.CSSProperties = {
-  maxHeight: "calc(100vh - 280px)",
+  flex: "1 1 auto",
+  minHeight: 0,
   overflowY: "auto",
 };
 
@@ -1289,6 +1547,7 @@ const layerRowStyle: React.CSSProperties = {
 };
 
 const toggleButtonStyle: React.CSSProperties = {
+  minHeight: 44,
   border: "1px solid #334155",
   borderRadius: 6,
   cursor: "pointer",
@@ -1308,17 +1567,21 @@ const layerNameButtonStyle: React.CSSProperties = {
   borderRadius: 6,
   cursor: "pointer",
   textAlign: "left",
+  minHeight: 44,
   fontSize: 12,
   color: "#fff",
 };
 
 const layerMetaStyle: React.CSSProperties = {
   color: "#94a3b8",
-  fontSize: 10,
+  fontSize: 11,
   lineHeight: 1.2,
 };
 
 const featurePanelStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  minHeight: 0,
   position: "absolute",
   top: 10,
   right: 10,
@@ -1326,10 +1589,11 @@ const featurePanelStyle: React.CSSProperties = {
   width: 320,
   maxHeight: "52vh",
   padding: 12,
-  background: "rgba(10, 10, 10, 0.9)",
-  border: "1px solid #333",
+  background: "rgba(8, 15, 28, 0.97)",
+  border: "1px solid #475569",
   borderRadius: 8,
   color: "#fff",
+  boxShadow: "0 4px 8px rgba(0,0,0,0.42)",
 };
 
 const selectedLayerNameStyle: React.CSSProperties = {
@@ -1338,7 +1602,7 @@ const selectedLayerNameStyle: React.CSSProperties = {
   gap: 2,
   marginBottom: 8,
   color: "#94a3b8",
-  fontSize: 11,
+  fontSize: 12,
 };
 
 const featureSearchStyle: React.CSSProperties = {
@@ -1350,26 +1614,35 @@ const featureSearchStyle: React.CSSProperties = {
   background: "#0f172a",
   border: "1px solid #334155",
   borderRadius: 6,
-  outline: "none",
+  fontSize: 13,
+};
+
+const fieldLabelStyle: React.CSSProperties = {
+  display: "block",
+  marginBottom: 5,
+  color: "#cbd5e1",
   fontSize: 12,
+  fontWeight: 700,
 };
 
 const featureHintStyle: React.CSSProperties = {
   marginBottom: 8,
   color: "#94a3b8",
-  fontSize: 11,
+  fontSize: 12,
   lineHeight: 1.35,
 };
 
 const featureListStyle: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
+  flex: "1 1 auto",
+  minHeight: 0,
   gap: 6,
-  maxHeight: "34vh",
   overflowY: "auto",
 };
 
 const featureButtonStyle: React.CSSProperties = {
+  minHeight: 44,
   padding: "7px 8px",
   background: "#111827",
   color: "#e5e7eb",
@@ -1377,7 +1650,7 @@ const featureButtonStyle: React.CSSProperties = {
   borderRadius: 6,
   cursor: "pointer",
   textAlign: "left",
-  fontSize: 12,
+  fontSize: 13,
 };
 
 const resetGlobeButtonStyle: React.CSSProperties = {
@@ -1385,8 +1658,8 @@ const resetGlobeButtonStyle: React.CSSProperties = {
   bottom: 110,
   right: 10,
   zIndex: 15,
-  width: 34,
-  height: 34,
+  width: 44,
+  height: 44,
   background: "#FFF",
   border: "none",
   borderRadius: "50%",
