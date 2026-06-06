@@ -163,7 +163,9 @@ self.onmessage = async (event: MessageEvent<ParseRequest>) => {
     const entryByName = new Map(entries.map((entry) => [entry.filename.toLowerCase(), entry]));
     const shapeEntries = entries.filter((entry) => entry.filename.toLowerCase().endsWith(".shp"));
 
-    if (!shapeEntries.length) throw new Error("ไม่พบไฟล์ .shp ภายใน ZIP");
+    if (!shapeEntries.length) {
+      throw new Error("ไม่พบไฟล์ .shp ภายใน ZIP หากเป็น raster ให้ใช้ .tif/.tiff หรือ ZIP ที่มี GeoTIFF");
+    }
 
     self.postMessage({ type: "start", total: shapeEntries.length, uncompressedBytes });
 

@@ -1,6 +1,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
+import { iter, type ZipItem } from "but-unzip";
+import { fromBlob } from "geotiff";
 
 import "maplibre-gl/dist/maplibre-gl.css";
 
@@ -23,10 +25,14 @@ const ARROW_HEAD_LAYER_ID = "annotation-arrows-head";
 const ARROW_HEAD_LENGTH = 0.00035;
 const ARROW_HEAD_ANGLE = Math.PI / 7;
 const MIN_DRAW_POINT_DISTANCE_PX = 10;
+const RASTER_SOURCE_ID = "uploaded-raster-source";
+const RASTER_LAYER_ID = "uploaded-raster-layer";
+const MAX_RASTER_PREVIEW_WIDTH = 1400;
+const LARGE_ZIP_UPLOAD_LIMIT_BYTES = 512 * 1024 * 1024;
 const TOUR_STEPS = [
   {
-    title: "เลือกไฟล์ SHP",
-    body: "เริ่มจากเลือกไฟล์ .zip จากเครื่อง ระบบจะแสดง progress ระหว่างอ่านไฟล์และแปลงข้อมูล",
+    title: "เลือกไฟล์แผนที่",
+    body: "เริ่มจากเลือกไฟล์ .zip, .tif หรือ .tiff จากเครื่อง ระบบจะแสดง progress ระหว่างอ่านไฟล์และแปลงข้อมูล",
     target: "upload",
   },
   {
@@ -97,11 +103,58 @@ interface ParsedShapeCollection {
   detailLimited: boolean;
 }
 
+interface RasterOverlay {
+  name: string;
+  url: string;
+  sourceType: "file" | "zip";
+  archiveName?: string;
+  sourceWidth: number;
+  sourceHeight: number;
+  previewWidth: number;
+  previewHeight: number;
+  overviewIndex: number;
+  overviewCount: number;
+}
+
 interface LoadStage {
   current: number;
   total: number;
   label: string;
 }
+
+interface ZipMapFileInfo {
+  shapeEntries: ZipItem[];
+  rasterEntry?: ZipItem;
+}
+
+interface ParsedGeoTiff {
+  bbox: number[];
+  geoKeys: Record<string, unknown>;
+  sourceWidth: number;
+  sourceHeight: number;
+  previewWidth: number;
+  previewHeight: number;
+  overviewIndex: number;
+  overviewCount: number;
+  rgba: ArrayBuffer;
+}
+
+const getNormalizedFileName = (name: string) => name.trim().toLowerCase();
+const isZipFileName = (name: string) => /\.zip$/i.test(name.trim());
+const isGeoTiffFileName = (name: string) => /\.tiff?$/i.test(name.trim());
+const isShapeFileName = (name: string) => /\.shp$/i.test(name.trim());
+
+const formatFileSize = (bytes: number) => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  const gigabytes = bytes / 1024 / 1024 / 1024;
+  if (gigabytes >= 1) return `${gigabytes.toFixed(gigabytes >= 10 ? 0 : 1)} GB`;
+  const megabytes = bytes / 1024 / 1024;
+  return `${megabytes.toFixed(megabytes >= 10 ? 0 : 1)} MB`;
+};
+
+const getLargeZipRasterMessage = (file: File) =>
+  `ZIP นี้มีขนาด ${formatFileSize(file.size)} ใหญ่มากสำหรับอ่าน GeoTIFF ผ่าน browser ` +
+  "กรุณาแตก ZIP แล้วอัปโหลดไฟล์ .tif/.tiff โดยตรง ระบบจะอ่านแบบแบ่งช่วงและไม่ต้องโหลดทั้ง ZIP";
 
 const getDisplayName = (rawName: string, index: number) => {
   const parts = rawName.split("/");
@@ -110,6 +163,7 @@ const getDisplayName = (rawName: string, index: number) => {
 
 const getFeatureName = (feature: GeoJsonFeature, index: number) => {
   const props = feature.properties || {};
+
   return (
     props.name ||
     props.NAMETH ||
@@ -255,6 +309,107 @@ const buildArrowGeoJson = (
   }),
 });
 
+const toRadians = (degrees: number) => (degrees * Math.PI) / 180;
+const toDegrees = (radians: number) => (radians * 180) / Math.PI;
+
+const utmToLngLat = (easting: number, northing: number, epsgCode: number): LngLatTuple => {
+  const zone = epsgCode % 100;
+  const isSouthernHemisphere = Math.floor(epsgCode / 100) === 327;
+  const x = easting - 500000;
+  const y = isSouthernHemisphere ? northing - 10000000 : northing;
+  const scaleFactor = 0.9996;
+  const semiMajorAxis = 6378137;
+  const eccentricitySquared = 0.00669438;
+  const eccentricityPrimeSquared = eccentricitySquared / (1 - eccentricitySquared);
+  const e1 =
+    (1 - Math.sqrt(1 - eccentricitySquared)) / (1 + Math.sqrt(1 - eccentricitySquared));
+  const meridionalArc = y / scaleFactor;
+  const mu =
+    meridionalArc /
+    (semiMajorAxis *
+      (1 -
+        eccentricitySquared / 4 -
+        (3 * eccentricitySquared ** 2) / 64 -
+        (5 * eccentricitySquared ** 3) / 256));
+
+  const phi1 =
+    mu +
+    ((3 * e1) / 2 - (27 * e1 ** 3) / 32) * Math.sin(2 * mu) +
+    ((21 * e1 ** 2) / 16 - (55 * e1 ** 4) / 32) * Math.sin(4 * mu) +
+    ((151 * e1 ** 3) / 96) * Math.sin(6 * mu) +
+    ((1097 * e1 ** 4) / 512) * Math.sin(8 * mu);
+  const sinPhi1 = Math.sin(phi1);
+  const cosPhi1 = Math.cos(phi1);
+  const tanPhi1 = Math.tan(phi1);
+  const n1 = semiMajorAxis / Math.sqrt(1 - eccentricitySquared * sinPhi1 ** 2);
+  const t1 = tanPhi1 ** 2;
+  const c1 = eccentricityPrimeSquared * cosPhi1 ** 2;
+  const r1 =
+    (semiMajorAxis * (1 - eccentricitySquared)) /
+    (1 - eccentricitySquared * sinPhi1 ** 2) ** 1.5;
+  const d = x / (n1 * scaleFactor);
+
+  const latitude =
+    phi1 -
+    ((n1 * tanPhi1) / r1) *
+      (d ** 2 / 2 -
+        ((5 + 3 * t1 + 10 * c1 - 4 * c1 ** 2 - 9 * eccentricityPrimeSquared) * d ** 4) / 24 +
+        ((61 +
+          90 * t1 +
+          298 * c1 +
+          45 * t1 ** 2 -
+          252 * eccentricityPrimeSquared -
+          3 * c1 ** 2) *
+          d ** 6) /
+          720);
+  const longitudeOrigin = (zone - 1) * 6 - 180 + 3;
+  const longitude =
+    toRadians(longitudeOrigin) +
+    (d -
+      ((1 + 2 * t1 + c1) * d ** 3) / 6 +
+      ((5 -
+        2 * c1 +
+        28 * t1 -
+        3 * c1 ** 2 +
+        8 * eccentricityPrimeSquared +
+        24 * t1 ** 2) *
+        d ** 5) /
+        120) /
+      cosPhi1;
+
+  return [toDegrees(longitude), toDegrees(latitude)];
+};
+
+const webMercatorToLngLat = (x: number, y: number): LngLatTuple => {
+  const semiMajorAxis = 6378137;
+  return [
+    toDegrees(x / semiMajorAxis),
+    toDegrees(Math.atan(Math.sinh(y / semiMajorAxis))),
+  ];
+};
+
+const getRasterCoordinates = (
+  bbox: number[],
+  geoKeys: Record<string, unknown>,
+): [LngLatTuple, LngLatTuple, LngLatTuple, LngLatTuple] => {
+  const [minX, minY, maxX, maxY] = bbox;
+  const epsgCode = Number(geoKeys.ProjectedCSTypeGeoKey || geoKeys.GeographicTypeGeoKey || 4326);
+  const convert = (x: number, y: number): LngLatTuple => {
+    if (epsgCode === 4326) return [x, y];
+    if (epsgCode === 3857) return webMercatorToLngLat(x, y);
+    if (epsgCode >= 32601 && epsgCode <= 32660) return utmToLngLat(x, y, epsgCode);
+    if (epsgCode >= 32701 && epsgCode <= 32760) return utmToLngLat(x, y, epsgCode);
+    throw new Error(`ยังไม่รองรับระบบพิกัด EPSG:${epsgCode}`);
+  };
+
+  return [
+    convert(minX, maxY),
+    convert(maxX, maxY),
+    convert(maxX, minY),
+    convert(minX, minY),
+  ];
+};
+
 const addArrowLayers = (map: maplibregl.Map, arrows: ArrowAnnotation[]) => {
   if (map.getSource(ARROW_SOURCE_ID)) return;
 
@@ -289,6 +444,7 @@ const MapGlobeShp = () => {
   const popupLayerIdsRef = useRef<Set<string>>(new Set());
   const projectKeyRef = useRef("");
   const arrowAnnotationsRef = useRef<ArrowAnnotation[]>([]);
+  const rasterUrlRef = useRef("");
   const isDrawingArrowRef = useRef(false);
   const draftArrowPointsRef = useRef<LngLatTuple[]>([]);
 
@@ -300,6 +456,7 @@ const MapGlobeShp = () => {
   const [openingLayerId, setOpeningLayerId] = useState<string>("");
   const [projectKey, setProjectKey] = useState("");
   const [arrowAnnotations, setArrowAnnotations] = useState<ArrowAnnotation[]>([]);
+  const [rasterOverlay, setRasterOverlay] = useState<RasterOverlay | null>(null);
   const [isDrawingArrow, setIsDrawingArrow] = useState(false);
   const [draftArrowPoints, setDraftArrowPoints] = useState<LngLatTuple[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -480,6 +637,49 @@ const MapGlobeShp = () => {
   const clearLoadedLayers = () => {
     shapeLayers.forEach(removeLayerFromMap);
     popupLayerIdsRef.current.clear();
+  };
+
+  const removeRasterOverlay = () => {
+    const map = mapRef.current;
+    if (map?.getLayer(RASTER_LAYER_ID)) map.removeLayer(RASTER_LAYER_ID);
+    if (map?.getSource(RASTER_SOURCE_ID)) map.removeSource(RASTER_SOURCE_ID);
+    if (rasterUrlRef.current) URL.revokeObjectURL(rasterUrlRef.current);
+    rasterUrlRef.current = "";
+    setRasterOverlay(null);
+  };
+
+  const addRasterOverlay = (
+    url: string,
+    coordinates: [LngLatTuple, LngLatTuple, LngLatTuple, LngLatTuple],
+  ) => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    if (map.getLayer(RASTER_LAYER_ID)) map.removeLayer(RASTER_LAYER_ID);
+    if (map.getSource(RASTER_SOURCE_ID)) map.removeSource(RASTER_SOURCE_ID);
+
+    map.addSource(RASTER_SOURCE_ID, {
+      type: "image",
+      url,
+      coordinates,
+    });
+    const rasterLayer: maplibregl.LayerSpecification = {
+      id: RASTER_LAYER_ID,
+      type: "raster",
+      source: RASTER_SOURCE_ID,
+      paint: { "raster-opacity": 0.72 },
+    };
+    if (map.getLayer(ARROW_LINE_LAYER_ID)) {
+      map.addLayer(rasterLayer, ARROW_LINE_LAYER_ID);
+    } else {
+      map.addLayer(rasterLayer);
+    }
+
+    const bounds = new maplibregl.LngLatBounds();
+    coordinates.forEach((coordinate) => bounds.extend(coordinate));
+    if (!bounds.isEmpty()) {
+      map.fitBounds(bounds, { padding: 70, duration: 1200, maxZoom: 16 });
+    }
   };
 
   const registerPopup = (layerId: string) => {
@@ -679,10 +879,113 @@ const MapGlobeShp = () => {
         setStatusText(`กำลังอ่านไฟล์ ${percent}%`);
       };
 
-      reader.onerror = () => reject(reader.error || new Error("อ่านไฟล์ไม่สำเร็จ"));
+      reader.onerror = () => {
+        if (file.size > LARGE_ZIP_UPLOAD_LIMIT_BYTES) {
+          reject(new Error(getLargeZipRasterMessage(file)));
+          return;
+        }
+        reject(
+          new Error(
+            "อ่านไฟล์ ZIP ไม่สำเร็จ หากเป็น GeoTIFF/COG ขนาดใหญ่ ให้แตก ZIP แล้วอัปโหลด .tif/.tiff โดยตรง",
+          ),
+        );
+      };
       reader.onload = () => resolve(reader.result as ArrayBuffer);
       reader.readAsArrayBuffer(file);
     });
+
+  const inspectZipMapFiles = (buffer: ArrayBuffer): ZipMapFileInfo => {
+    const entries = Array.from(iter(new Uint8Array(buffer))).filter(
+      (entry) => !entry.filename.includes("__MACOSX"),
+    );
+    const shapeEntries = entries.filter((entry) => isShapeFileName(entry.filename));
+    const rasterEntry = entries.find((entry) => {
+      return isGeoTiffFileName(entry.filename);
+    });
+
+    return { shapeEntries, rasterEntry };
+  };
+
+  const extractRasterFileFromZip = async (entry: ZipItem) => {
+    const bytes = await entry.read();
+    const name = entry.filename.split(/[\\/]/).pop() || "raster.tif";
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    return new File([copy.buffer], name, { type: "image/tiff" });
+  };
+
+  const createRasterImageUrl = (rgba: ArrayBuffer, width: number, height: number) =>
+    new Promise<string>((resolve, reject) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) {
+        reject(new Error("ไม่สามารถสร้างภาพ raster preview ได้"));
+        return;
+      }
+
+      context.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error("ไม่สามารถแปลง raster preview เป็นภาพได้"));
+          return;
+        }
+        resolve(URL.createObjectURL(blob));
+      }, "image/png");
+    });
+
+  const pickGeoTiffPreviewImage = async (tiff: Awaited<ReturnType<typeof fromBlob>>) => {
+    const count = await tiff.getImageCount();
+    const images = [];
+
+    for (let index = 0; index < count; index += 1) {
+      const image = await tiff.getImage(index);
+      images.push(image);
+      if (image.getWidth() <= MAX_RASTER_PREVIEW_WIDTH) return { image, index, count };
+    }
+
+    return { image: images[images.length - 1], index: images.length - 1, count };
+  };
+
+  const parseGeoTiffFromFile = async (file: File): Promise<ParsedGeoTiff> => {
+    setStatusText("กำลังอ่าน GeoTIFF metadata...");
+    const tiff = await fromBlob(file);
+    const baseImage = await tiff.getImage(0);
+    const { image, index, count } = await pickGeoTiffPreviewImage(tiff);
+    const baseWidth = baseImage.getWidth();
+    const baseHeight = baseImage.getHeight();
+    const bbox = baseImage.getBoundingBox();
+    const geoKeys = baseImage.getGeoKeys() as Record<string, unknown>;
+
+    setStatusText(
+      `กำลังอ่านภาพย่อ ${image.getWidth().toLocaleString()} x ${image
+        .getHeight()
+        .toLocaleString()} px`,
+    );
+
+    const rgb = await image.readRGB({ interleave: true });
+    const rgba = new Uint8ClampedArray(rgb.width * rgb.height * 4);
+
+    for (let sourceIndex = 0, targetIndex = 0; sourceIndex < rgb.length; sourceIndex += 3, targetIndex += 4) {
+      rgba[targetIndex] = rgb[sourceIndex];
+      rgba[targetIndex + 1] = rgb[sourceIndex + 1];
+      rgba[targetIndex + 2] = rgb[sourceIndex + 2];
+      rgba[targetIndex + 3] = 220;
+    }
+
+    return {
+      bbox,
+      geoKeys,
+      sourceWidth: baseWidth,
+      sourceHeight: baseHeight,
+      previewWidth: rgb.width,
+      previewHeight: rgb.height,
+      overviewIndex: index,
+      overviewCount: count,
+      rgba: rgba.buffer,
+    };
+  };
 
   const parseShapeInWorker = (buffer: ArrayBuffer) =>
     new Promise<ParsedShapeCollection[]>((resolve, reject) => {
@@ -789,6 +1092,7 @@ const MapGlobeShp = () => {
 
     try {
       clearLoadedLayers();
+      removeRasterOverlay();
       const collections = await parseShapeInWorker(buffer);
       setLoadStage({ current: 3, total: 3, label: "เตรียมชั้นข้อมูล" });
       setUploadProgress(75);
@@ -845,15 +1149,117 @@ const MapGlobeShp = () => {
     }
   };
 
+  const loadRasterFile = async (
+    file: File,
+    nextProjectKey: string,
+    source: { type: "file" | "zip"; archiveName?: string } = { type: "file" },
+  ) => {
+    if (!mapRef.current) return;
+
+    setIsLoading(true);
+    setUploadProgress(8);
+    setLoadStage({ current: 1, total: 3, label: "อ่าน GeoTIFF metadata" });
+    setStatusText(
+      source.type === "zip"
+        ? `กำลังแตก GeoTIFF จาก ZIP: ${file.name}`
+        : `กำลังอ่านไฟล์ raster ${file.name}`,
+    );
+    await waitForPaint();
+
+    try {
+      clearLoadedLayers();
+      removeRasterOverlay();
+      setShapeLayers([]);
+      setSelectedLayerId("");
+      setLayerSearch("");
+      setFeatureSearch("");
+
+      const parsed = await parseGeoTiffFromFile(file);
+      setUploadProgress(66);
+      setLoadStage({ current: 2, total: 3, label: "สร้างภาพ preview" });
+      setStatusText("กำลังสร้างภาพสำหรับวางบนแผนที่...");
+      await waitForPaint();
+
+      const coordinates = getRasterCoordinates(parsed.bbox, parsed.geoKeys);
+      const url = await createRasterImageUrl(parsed.rgba, parsed.previewWidth, parsed.previewHeight);
+
+      rasterUrlRef.current = url;
+      addRasterOverlay(url, coordinates);
+      setProjectKey(nextProjectKey);
+      setArrowAnnotations(loadSavedArrows(nextProjectKey));
+      setRasterOverlay({
+        name: file.name,
+        url,
+        sourceType: source.type,
+        archiveName: source.archiveName,
+        sourceWidth: parsed.sourceWidth,
+        sourceHeight: parsed.sourceHeight,
+        previewWidth: parsed.previewWidth,
+        previewHeight: parsed.previewHeight,
+        overviewIndex: parsed.overviewIndex,
+        overviewCount: parsed.overviewCount,
+      });
+      setUploadProgress(100);
+      setLoadStage({ current: 3, total: 3, label: "แสดงบนแผนที่" });
+      setStatusText("");
+    } catch (err) {
+      console.error(err);
+      setStatusText(err instanceof Error ? err.message : "เปิด GeoTIFF ไม่สำเร็จ");
+    } finally {
+      setIsLoading(false);
+      setUploadProgress(null);
+      setLoadStage(null);
+    }
+  };
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const nextProjectKey = getArrowProjectKey(file);
+    const normalizedFileName = getNormalizedFileName(file.name);
+    const isZip = isZipFileName(normalizedFileName);
+    const isGeoTiff = isGeoTiffFileName(normalizedFileName) || file.type === "image/tiff";
     setIsLoading(true);
     setUploadProgress(0);
-    setLoadStage({ current: 1, total: 3, label: "อ่านไฟล์ ZIP" });
+    setLoadStage({
+      current: 1,
+      total: 3,
+      label: isGeoTiff ? "เตรียม GeoTIFF" : "อ่านไฟล์ ZIP",
+    });
     try {
-      await loadShapeBuffer(await readZipFile(file), file.name, nextProjectKey);
+      if (isZip) {
+        if (file.size > LARGE_ZIP_UPLOAD_LIMIT_BYTES) {
+          throw new Error(getLargeZipRasterMessage(file));
+        }
+
+        const buffer = await readZipFile(file);
+        const { rasterEntry, shapeEntries } = inspectZipMapFiles(buffer);
+
+        if (rasterEntry) {
+          setLoadStage({ current: 2, total: 3, label: "แตก GeoTIFF จาก ZIP" });
+          setStatusText(`พบ GeoTIFF ใน ZIP: ${rasterEntry.filename}`);
+          setUploadProgress(24);
+          await loadRasterFile(await extractRasterFileFromZip(rasterEntry), nextProjectKey, {
+            type: "zip",
+            archiveName: file.name,
+          });
+          return;
+        }
+
+        if (shapeEntries.length > 0) {
+          await loadShapeBuffer(buffer, file.name, nextProjectKey);
+          return;
+        }
+
+        throw new Error("ZIP นี้ไม่มี .shp หรือ .tif/.tiff ที่ระบบอ่านได้");
+      }
+
+      if (isGeoTiff) {
+        await loadRasterFile(file, nextProjectKey);
+        return;
+      }
+
+      throw new Error("รองรับเฉพาะไฟล์ .zip, .tif และ .tiff");
     } catch (err) {
       console.error(err);
       setStatusText(err instanceof Error ? err.message : "อ่านไฟล์ไม่สำเร็จ");
@@ -867,6 +1273,7 @@ const MapGlobeShp = () => {
 
   const handleClear = () => {
     clearLoadedLayers();
+    removeRasterOverlay();
     setShapeLayers([]);
     setSelectedLayerId("");
     setProjectKey("");
@@ -976,7 +1383,11 @@ const MapGlobeShp = () => {
     });
 
     mapRef.current = map;
-    return () => map.remove();
+    return () => {
+      if (rasterUrlRef.current) URL.revokeObjectURL(rasterUrlRef.current);
+      rasterUrlRef.current = "";
+      map.remove();
+    };
   }, [appendDraftPoint]);
 
   const selectedLayer = shapeLayers.find((layer) => layer.id === selectedLayerId);
@@ -1019,6 +1430,18 @@ const MapGlobeShp = () => {
     return items;
   }, [featureSearch, selectedLayer]);
 
+  const hasLoadedData = shapeLayers.length > 0 || Boolean(rasterOverlay);
+  const rasterSourceLabel =
+    rasterOverlay?.sourceType === "zip" && rasterOverlay.archiveName
+      ? `นำเข้าจาก ZIP: ${rasterOverlay.archiveName}`
+      : "อัปโหลดไฟล์ .tif/.tiff โดยตรง";
+  const rasterOriginalSize = rasterOverlay
+    ? `${rasterOverlay.sourceWidth.toLocaleString()} x ${rasterOverlay.sourceHeight.toLocaleString()} px`
+    : "";
+  const rasterPreviewSize = rasterOverlay
+    ? `${rasterOverlay.previewWidth.toLocaleString()} x ${rasterOverlay.previewHeight.toLocaleString()} px`
+    : "";
+
   return (
     <div style={pageStyle}>
       <button
@@ -1032,7 +1455,7 @@ const MapGlobeShp = () => {
 
       <div className="left-stack" style={leftStackStyle}>
         <div
-          className={`upload-panel ${shapeLayers.length > 0 ? "has-data" : ""}`}
+          className={`upload-panel ${hasLoadedData ? "has-data" : ""}`}
           style={{
             ...panelStyle,
             ...(activeTourStep?.target === "upload" ? tourHighlightStyle : null),
@@ -1043,16 +1466,16 @@ const MapGlobeShp = () => {
             aria-hidden="true"
             tabIndex={-1}
             type="file"
-            accept=".zip"
+            accept=".zip,.tif,.tiff,image/tiff"
             onChange={handleFileUpload}
             disabled={isLoading}
             style={hiddenFileInputStyle}
           />
-          {shapeLayers.length === 0 ? (
+          {!hasLoadedData ? (
             <>
               <div style={emptyStateTitleStyle}>เปิดดูข้อมูลแผนที่</div>
               <div style={emptyStateBodyStyle}>
-                เลือกไฟล์ Shapefile แบบ ZIP เพื่อดูชั้นข้อมูลและตำแหน่งบนแผนที่
+                เลือกไฟล์ Shapefile แบบ ZIP หรือ GeoTIFF/COG เพื่อดูข้อมูลบนแผนที่
               </div>
               <button
                 className="ui-button"
@@ -1064,15 +1487,33 @@ const MapGlobeShp = () => {
                   opacity: isLoading ? 0.72 : 1,
                 }}
               >
-                {isLoading ? "กำลังอ่านไฟล์..." : "เลือกไฟล์แผนที่ (.zip)"}
+                {isLoading ? "กำลังอ่านไฟล์..." : "เลือกไฟล์แผนที่"}
               </button>
-              <div style={uploadHintStyle}>ไฟล์ควรมี .shp, .dbf, .shx และ .prj</div>
+              <div style={uploadHintStyle}>
+                รองรับ .zip, .tif, .tiff และ ZIP ที่มี GeoTIFF ไฟล์ raster ใหญ่ควรอัป .tif
+                ตรง
+              </div>
             </>
           ) : (
             <div style={loadedFileHeaderStyle}>
-              <div>
-                <div style={loadedFileTitleStyle}>ชั้นข้อมูลพร้อมใช้งาน</div>
-                <div style={loadedFileMetaStyle}>{shapeLayers.length.toLocaleString()} ชั้นข้อมูล</div>
+              <div style={loadedFileInfoStyle}>
+                <div style={loadedFileTitleStyle}>
+                  {rasterOverlay ? "ภาพ GeoTIFF พร้อมใช้งาน" : "ชั้นข้อมูลพร้อมใช้งาน"}
+                </div>
+                <div style={loadedFileMetaStyle}>
+                  {rasterOverlay
+                    ? rasterOverlay.name
+                    : `${shapeLayers.length.toLocaleString()} ชั้นข้อมูล`}
+                </div>
+                {rasterOverlay && (
+                  <>
+                    <div style={rasterBadgeGridStyle}>
+                      <span style={rasterBadgeStyle}>ต้นฉบับ {rasterOriginalSize}</span>
+                      <span style={rasterPreviewBadgeStyle}>ย่อเพื่อแสดงผล {rasterPreviewSize}</span>
+                    </div>
+                    <div style={rasterSourceStyle}>{rasterSourceLabel}</div>
+                  </>
+                )}
               </div>
               <button
                 className="ui-button"
@@ -1411,26 +1852,70 @@ const helpButtonStyle: React.CSSProperties = {
 
 const loadedFileHeaderStyle: React.CSSProperties = {
   display: "flex",
-  alignItems: "center",
+  alignItems: "flex-start",
   justifyContent: "space-between",
   gap: 12,
+};
+
+const loadedFileInfoStyle: React.CSSProperties = {
+  minWidth: 0,
+  flex: "1 1 auto",
 };
 
 const loadedFileTitleStyle: React.CSSProperties = {
   color: "#0f172a",
   fontSize: 14,
   fontWeight: 800,
+  lineHeight: 1.3,
 };
 
 const loadedFileMetaStyle: React.CSSProperties = {
-  marginTop: 2,
+  marginTop: 3,
   color: "#64748b",
+  fontSize: 12,
+  lineHeight: 1.35,
+  overflowWrap: "anywhere",
+};
+
+const rasterBadgeGridStyle: React.CSSProperties = {
+  display: "flex",
+  flexWrap: "wrap",
+  gap: 6,
+  marginTop: 8,
+};
+
+const rasterBadgeStyle: React.CSSProperties = {
+  padding: "4px 7px",
+  color: "#0f172a",
+  background: "#f1f5f9",
+  border: "1px solid #cbd5e1",
+  borderRadius: 6,
   fontSize: 11,
+  fontWeight: 750,
+  lineHeight: 1.2,
+  whiteSpace: "nowrap",
+};
+
+const rasterPreviewBadgeStyle: React.CSSProperties = {
+  ...rasterBadgeStyle,
+  color: "#075985",
+  background: "#e0f2fe",
+  border: "1px solid #bae6fd",
+};
+
+const rasterSourceStyle: React.CSSProperties = {
+  marginTop: 7,
+  color: "#475569",
+  fontSize: 11,
+  lineHeight: 1.35,
+  overflowWrap: "anywhere",
 };
 
 const secondaryButtonStyle: React.CSSProperties = {
-  minHeight: 36,
-  padding: "7px 10px",
+  flex: "0 0 auto",
+  minHeight: 40,
+  minWidth: 78,
+  padding: "7px 11px",
   color: "#0f172a",
   background: "#e2e8f0",
   border: "none",

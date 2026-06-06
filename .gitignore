@@ -24,3 +24,11 @@ dist-ssr
 *.sw?
 
 .vercel
+
+# Local Codex and design-skill workspace files
+.agents/
+.claude/
+.cursor/
+.gemini/
+.impeccable/
+PRODUCT.md
