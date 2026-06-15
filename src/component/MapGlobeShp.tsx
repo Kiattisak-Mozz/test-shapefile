@@ -68,29 +68,6 @@ const LAYER_COLORS = [
   "#4ade80",
   "#f472b6",
 ];
-const backendStructureExample = `GET /api/map/layers
-
-{
-  "layers": [
-    {
-      "id": "land-parcels",
-      "name": "ข้อมูลแปลงที่ดิน",
-      "geojson": {
-        "type": "FeatureCollection",
-        "features": [
-          {
-            "type": "Feature",
-            "properties": { "id": 1, "name": "แปลง A" },
-            "geometry": {
-              "type": "Polygon",
-              "coordinates": [[[100.47, 13.78], [100.55, 13.78], [100.55, 13.82], [100.47, 13.78]]]
-            }
-          }
-        ]
-      }
-    }
-  ]
-}`;
 
 type GeoJsonFeature = GeoJSON.Feature<GeoJSON.Geometry, Record<string, any>>;
 type LngLatTuple = [number, number];
@@ -2124,19 +2101,7 @@ const modeSwitchButtonActiveStyle: React.CSSProperties = {
   boxShadow: "0 1px 3px rgba(37, 99, 235, 0.2)",
 };
 
-const backendStructureStyle: React.CSSProperties = {
-  maxHeight: 260,
-  overflow: "auto",
-  margin: "12px 0 0",
-  padding: 12,
-  color: "#dbeafe",
-  background: "#0f172a",
-  border: "1px solid #334155",
-  borderRadius: 7,
-  fontSize: 11,
-  lineHeight: 1.45,
-  whiteSpace: "pre-wrap",
-};
+
 
 const helpButtonStyle: React.CSSProperties = {
   marginTop: 10,
