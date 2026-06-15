@@ -467,7 +467,14 @@ const MapGlobeShp = () => {
   const [loadStage, setLoadStage] = useState<LoadStage | null>(null);
   const [statusText, setStatusText] = useState("");
   const [tourStep, setTourStep] = useState<number | null>(null);
-  const [uploadMode, setUploadMode] = useState<UploadMode>("file");
+  const [uploadMode, setUploadMode] = useState<UploadMode>(() => {
+    const saved = localStorage.getItem("uploadMode");
+    return (saved === "backend" ? "backend" : "file") as UploadMode;
+  });
+
+  useEffect(() => {
+    localStorage.setItem("uploadMode", uploadMode);
+  }, [uploadMode]);
 
   useEffect(() => {
     Object.keys(localStorage)
