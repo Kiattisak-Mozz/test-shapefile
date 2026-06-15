@@ -68,9 +68,33 @@ const LAYER_COLORS = [
   "#4ade80",
   "#f472b6",
 ];
+const backendStructureExample = `GET /api/map/layers
+
+{
+  "layers": [
+    {
+      "id": "land-parcels",
+      "name": "ข้อมูลแปลงที่ดิน",
+      "geojson": {
+        "type": "FeatureCollection",
+        "features": [
+          {
+            "type": "Feature",
+            "properties": { "id": 1, "name": "แปลง A" },
+            "geometry": {
+              "type": "Polygon",
+              "coordinates": [[[100.47, 13.78], [100.55, 13.78], [100.55, 13.82], [100.47, 13.78]]]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}`;
 
 type GeoJsonFeature = GeoJSON.Feature<GeoJSON.Geometry, Record<string, any>>;
 type LngLatTuple = [number, number];
+type UploadMode = "file" | "backend";
 
 interface ArrowAnnotation {
   id: string;
@@ -143,6 +167,7 @@ const getNormalizedFileName = (name: string) => name.trim().toLowerCase();
 const isZipFileName = (name: string) => /\.zip$/i.test(name.trim());
 const isGeoTiffFileName = (name: string) => /\.tiff?$/i.test(name.trim());
 const isShapeFileName = (name: string) => /\.shp$/i.test(name.trim());
+const isGeoJsonFileName = (name: string) => /\.geojson$/i.test(name.trim()) || /\.json$/i.test(name.trim());
 
 const formatFileSize = (bytes: number) => {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
@@ -438,7 +463,8 @@ const addArrowLayers = (map: maplibregl.Map, arrows: ArrowAnnotation[]) => {
 
 const MapGlobeShp = () => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const shapefileInputRef = useRef<HTMLInputElement | null>(null);
+  const geojsonInputRef = useRef<HTMLInputElement | null>(null);
   const layerSearchRef = useRef<HTMLInputElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const popupLayerIdsRef = useRef<Set<string>>(new Set());
@@ -464,6 +490,7 @@ const MapGlobeShp = () => {
   const [loadStage, setLoadStage] = useState<LoadStage | null>(null);
   const [statusText, setStatusText] = useState("");
   const [tourStep, setTourStep] = useState<number | null>(null);
+  const [uploadMode, setUploadMode] = useState<UploadMode>("file");
 
   useEffect(() => {
     Object.keys(localStorage)
@@ -1212,19 +1239,157 @@ const MapGlobeShp = () => {
     }
   };
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const loadGeoJsonFile = async (file: File, nextProjectKey: string) => {
+    if (!mapRef.current) return;
+
+    setIsLoading(true);
+    setUploadProgress(10);
+    setLoadStage({ current: 1, total: 2, label: "อ่านไฟล์ GeoJSON" });
+    setStatusText(`กำลังอ่านไฟล์ GeoJSON ${file.name}...`);
+    await waitForPaint();
+
+    try {
+      clearLoadedLayers();
+      removeRasterOverlay();
+      
+      const text = await file.text();
+      setUploadProgress(40);
+      setLoadStage({ current: 2, total: 2, label: "เตรียมชั้นข้อมูล" });
+      setStatusText("กำลังแปลงข้อมูล GeoJSON...");
+      await waitForPaint();
+
+      const parsed = JSON.parse(text);
+      let parsedLayers: { id?: string; name?: string; features: GeoJsonFeature[] }[] = [];
+
+      const extractFeatures = (obj: any): GeoJsonFeature[] => {
+        if (!obj || typeof obj !== "object") return [];
+        if (obj.type === "FeatureCollection" && Array.isArray(obj.features)) return obj.features;
+        if (obj.type === "Feature") return [obj];
+        if (obj.type && obj.coordinates) return [{ type: "Feature" as const, properties: {}, geometry: obj }];
+        if (Array.isArray(obj)) return obj.flatMap(item => extractFeatures(item));
+        if (obj.features && Array.isArray(obj.features)) return obj.features;
+        if (obj.geojson && obj.geojson.features) return obj.geojson.features;
+        return [];
+      };
+
+      if (parsed.layers && Array.isArray(parsed.layers)) {
+        parsedLayers = parsed.layers.map((layer: any, idx: number) => ({
+          id: layer.id || `layer-${idx}`,
+          name: layer.name || `Layer ${idx + 1}`,
+          features: extractFeatures(layer),
+        }));
+      } else {
+        const features = extractFeatures(parsed);
+        if (features.length > 0) {
+          parsedLayers = [{ features }];
+        } else {
+          // Fallback: search values for features
+          for (const val of Object.values(parsed)) {
+            const feats = extractFeatures(val);
+            if (feats.length > 0) {
+              parsedLayers = [{ features: feats }];
+              break;
+            }
+          }
+        }
+      }
+
+      if (parsedLayers.length === 0 || parsedLayers.every(l => l.features.length === 0)) {
+        throw new Error("รูปแบบไฟล์ไม่ถูกต้อง (ไม่พบข้อมูลพิกัด Feature ในไฟล์)");
+      }
+
+      const savedArrows = loadSavedArrows(nextProjectKey);
+
+      const nextLayers: ShapeLayer[] = parsedLayers.filter(l => l.features.length > 0).map((layer, index) => {
+        const id = layer.id || `geojson-${index}`;
+        const features = layer.features;
+        const geometryTypes = Array.from(new Set(features.map((f: any) => f.geometry?.type).filter(Boolean))) as string[];
+
+        return {
+          id,
+          sourceId: `${id}-source`,
+          fillLayerId: `${id}-fill`,
+          outlineLayerId: `${id}-outline`,
+          lineLayerId: `${id}-line`,
+          pointLayerId: `${id}-point`,
+          name: layer.name || getDisplayName(file.name, index),
+          color: LAYER_COLORS[index % LAYER_COLORS.length],
+          count: features.length,
+          geometryTypes,
+          features,
+          loaded: false,
+          visible: false,
+          detailLimited: false,
+        };
+      });
+
+      const shouldAutoOpen = nextLayers.length === 1 && nextLayers[0].count <= AUTO_ZOOM_FEATURE_LIMIT;
+      if (shouldAutoOpen) {
+        nextLayers[0].visible = true;
+        nextLayers[0].loaded = true;
+      }
+
+      setShapeLayers(nextLayers);
+      setSelectedLayerId(nextLayers[0]?.id || "");
+      setProjectKey(nextProjectKey);
+      setArrowAnnotations(savedArrows);
+      setLayerSearch("");
+      setFeatureSearch("");
+      setMobilePanel("layers");
+      setUploadProgress(100);
+      
+      if (shouldAutoOpen) {
+        setTimeout(() => {
+          if (mapRef.current) {
+            addLayerToMap(nextLayers[0]);
+            zoomToFeatures(nextLayers[0].features);
+          }
+        }, 100);
+        setStatusText(`แสดงผล 1 ชั้นข้อมูลบนแผนที่แล้ว${savedArrows.length ? ` (ลูกศร ${savedArrows.length} อัน)` : ""}`);
+      } else {
+        setStatusText(
+          `อ่านไฟล์แล้ว ${nextLayers.length} ชั้นข้อมูล ปิดไว้ทั้งหมด${
+            savedArrows.length ? ` โหลดลูกศร ${savedArrows.length} อัน` : ""
+          }`,
+        );
+      }
+    } catch (err) {
+      console.error(err);
+      setStatusText(err instanceof Error ? err.message : "อ่านไฟล์ GeoJSON ไม่สำเร็จ (ไฟล์อาจไม่ถูกต้องตาม format)");
+    } finally {
+      setIsLoading(false);
+      setUploadProgress(null);
+      setLoadStage(null);
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>, target: "shapefile" | "geojson") => {
     const file = e.target.files?.[0];
     if (!file) return;
     const nextProjectKey = getArrowProjectKey(file);
     const normalizedFileName = getNormalizedFileName(file.name);
     const isZip = isZipFileName(normalizedFileName);
     const isGeoTiff = isGeoTiffFileName(normalizedFileName) || file.type === "image/tiff";
+    const isGeoJson = isGeoJsonFileName(normalizedFileName) || file.type === "application/geo+json" || file.type === "application/json";
+
+    if (target === "shapefile" && isGeoJson) {
+      setStatusText("รองรับเฉพาะไฟล์ .zip, .tif, .tiff (หากต้องการอัปโหลด GeoJSON กรุณาไปที่แท็บ Backend GeoJSON)");
+      e.target.value = "";
+      return;
+    }
+
+    if (target === "geojson" && !isGeoJson) {
+      setStatusText("รองรับเฉพาะไฟล์ .geojson, .json");
+      e.target.value = "";
+      return;
+    }
+
     setIsLoading(true);
     setUploadProgress(0);
     setLoadStage({
       current: 1,
       total: 3,
-      label: isGeoTiff ? "เตรียม GeoTIFF" : "อ่านไฟล์ ZIP",
+      label: isGeoTiff ? "เตรียม GeoTIFF" : isGeoJson ? "อ่านไฟล์ GeoJSON" : "อ่านไฟล์ ZIP",
     });
     try {
       if (isZip) {
@@ -1259,7 +1424,12 @@ const MapGlobeShp = () => {
         return;
       }
 
-      throw new Error("รองรับเฉพาะไฟล์ .zip, .tif และ .tiff");
+      if (isGeoJson) {
+        await loadGeoJsonFile(file, nextProjectKey);
+        return;
+      }
+
+      throw new Error("รองรับเฉพาะไฟล์ .zip, .tif, .tiff และ .geojson");
     } catch (err) {
       console.error(err);
       setStatusText(err instanceof Error ? err.message : "อ่านไฟล์ไม่สำเร็จ");
@@ -1462,37 +1632,110 @@ const MapGlobeShp = () => {
           }}
         >
           <input
-            ref={fileInputRef}
+            ref={shapefileInputRef}
             aria-hidden="true"
             tabIndex={-1}
             type="file"
             accept=".zip,.tif,.tiff,image/tiff"
-            onChange={handleFileUpload}
+            onChange={(e) => handleFileUpload(e, "shapefile")}
             disabled={isLoading}
             style={hiddenFileInputStyle}
           />
+          <input
+            ref={geojsonInputRef}
+            aria-hidden="true"
+            tabIndex={-1}
+            type="file"
+            accept=".geojson,.json,application/geo+json,application/json"
+            onChange={(e) => handleFileUpload(e, "geojson")}
+            disabled={isLoading}
+            style={hiddenFileInputStyle}
+          />
+          <div style={modeSwitchStyle} role="tablist" aria-label="เลือกโหมดนำเข้าข้อมูล">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={uploadMode === "file"}
+              onClick={() => {
+                setUploadMode("file");
+                setStatusText("");
+              }}
+              disabled={isLoading}
+              style={{
+                ...modeSwitchButtonStyle,
+                ...(uploadMode === "file" ? modeSwitchButtonActiveStyle : null),
+              }}
+            >
+              Upload Shapefile
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={uploadMode === "backend"}
+              onClick={() => {
+                setUploadMode("backend");
+                setStatusText("");
+              }}
+              disabled={isLoading}
+              style={{
+                ...modeSwitchButtonStyle,
+                ...(uploadMode === "backend" ? modeSwitchButtonActiveStyle : null),
+              }}
+            >
+              Backend GeoJSON
+            </button>
+          </div>
           {!hasLoadedData ? (
             <>
-              <div style={emptyStateTitleStyle}>เปิดดูข้อมูลแผนที่</div>
-              <div style={emptyStateBodyStyle}>
-                เลือกไฟล์ Shapefile แบบ ZIP หรือ GeoTIFF/COG เพื่อดูข้อมูลบนแผนที่
-              </div>
-              <button
-                className="ui-button"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isLoading}
-                style={{
-                  ...primaryUploadButtonStyle,
-                  cursor: isLoading ? "wait" : "pointer",
-                  opacity: isLoading ? 0.72 : 1,
-                }}
-              >
-                {isLoading ? "กำลังอ่านไฟล์..." : "เลือกไฟล์แผนที่"}
-              </button>
-              <div style={uploadHintStyle}>
-                รองรับ .zip, .tif, .tiff และ ZIP ที่มี GeoTIFF ไฟล์ raster ใหญ่ควรอัป .tif
-                ตรง
-              </div>
+              {uploadMode === "file" ? (
+                <>
+                  <div style={emptyStateTitleStyle}>Upload Shapefile</div>
+                  <div style={emptyStateBodyStyle}>
+                    เลือกไฟล์ Shapefile แบบ ZIP หรือ GeoTIFF/COG เพื่อดูข้อมูลบนแผนที่
+                  </div>
+                  <button
+                    className="ui-button"
+                    onClick={() => shapefileInputRef.current?.click()}
+                    disabled={isLoading}
+                    style={{
+                      ...primaryUploadButtonStyle,
+                      cursor: isLoading ? "wait" : "pointer",
+                      opacity: isLoading ? 0.72 : 1,
+                    }}
+                  >
+                    {isLoading ? "กำลังอ่านไฟล์..." : "เลือกไฟล์แผนที่"}
+                  </button>
+                  <div style={uploadHintStyle}>
+                    รองรับ .zip, .tif, .tiff และ ZIP ที่มี GeoTIFF ไฟล์ raster ใหญ่ควรอัป .tif ตรง
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={emptyStateTitleStyle}>GeoJSON structure backend</div>
+                  <div style={emptyStateBodyStyle}>
+                    หลังบ้านควรส่ง GeoJSON เป็น JSON response แล้ว frontend เรียก API ด้วย fetch
+                    ก่อนส่ง features เข้า layer
+                  </div>
+                 
+                  <button
+                    className="ui-button"
+                    onClick={() => geojsonInputRef.current?.click()}
+                    disabled={isLoading}
+                    style={{
+                      ...primaryUploadButtonStyle,
+                      backgroundColor: "#ef4444",
+                      cursor: isLoading ? "wait" : "pointer",
+                      opacity: isLoading ? 0.72 : 1,
+                    }}
+                  >
+                    {isLoading ? "กำลังอ่านไฟล์..." : "เลือกไฟล์ GeoJSON"}
+                  </button>
+                  <div style={uploadHintStyle}>
+                    พิกัดต้องเป็น GeoJSON มาตรฐาน [lng, lat]<br />
+                    รองรับเฉพาะไฟล์ .geojson และ .json
+                  </div>
+                </>
+              )}
             </>
           ) : (
             <div style={loadedFileHeaderStyle}>
@@ -1515,14 +1758,22 @@ const MapGlobeShp = () => {
                   </>
                 )}
               </div>
-              <button
-                className="ui-button"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isLoading}
-                style={secondaryButtonStyle}
-              >
-                เปลี่ยนไฟล์
-              </button>
+              <div style={loadedActionGroupStyle}>
+                <button
+                  className="ui-button"
+                  onClick={() => {
+                    if (uploadMode === "backend") {
+                      geojsonInputRef.current?.click();
+                    } else {
+                      shapefileInputRef.current?.click();
+                    }
+                  }}
+                  disabled={isLoading}
+                  style={secondaryButtonStyle}
+                >
+                  เปลี่ยนไฟล์
+                </button>
+              </div>
             </div>
           )}
           {uploadProgress !== null && (
@@ -1544,7 +1795,13 @@ const MapGlobeShp = () => {
             </div>
           )}
           {statusText && (
-            <div aria-live="polite" style={statusStyle}>
+            <div
+              aria-live="polite"
+              style={{
+                ...statusStyle,
+                color: statusText.includes("รองรับเฉพาะไฟล์") || statusText.includes("ไม่สำเร็จ") || statusText.includes("ไม่ถูกต้อง") ? "#ef4444" : statusStyle.color,
+              }}
+            >
               {statusText}
             </div>
           )}
@@ -1825,7 +2082,7 @@ const primaryUploadButtonStyle: React.CSSProperties = {
   marginTop: 14,
   padding: "10px 14px",
   color: "#fff",
-  background: "#0f766e",
+  backgroundColor: "#0f766e",
   border: "none",
   borderRadius: 7,
   fontSize: 14,
@@ -1837,6 +2094,48 @@ const uploadHintStyle: React.CSSProperties = {
   color: "#64748b",
   fontSize: 11,
   lineHeight: 1.45,
+};
+
+const modeSwitchStyle: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "1fr 1fr",
+  gap: 4,
+  padding: 4,
+  marginBottom: 14,
+  background: "#e2e8f0",
+  borderRadius: 7,
+};
+
+const modeSwitchButtonStyle: React.CSSProperties = {
+  minHeight: 36,
+  padding: "7px 8px",
+  color: "#475569",
+  background: "transparent",
+  border: "none",
+  borderRadius: 5,
+  cursor: "pointer",
+  fontSize: 12,
+  fontWeight: 800,
+};
+
+const modeSwitchButtonActiveStyle: React.CSSProperties = {
+  color: "#2563eb",
+  background: "#ffffff",
+  boxShadow: "0 1px 3px rgba(37, 99, 235, 0.2)",
+};
+
+const backendStructureStyle: React.CSSProperties = {
+  maxHeight: 260,
+  overflow: "auto",
+  margin: "12px 0 0",
+  padding: 12,
+  color: "#dbeafe",
+  background: "#0f172a",
+  border: "1px solid #334155",
+  borderRadius: 7,
+  fontSize: 11,
+  lineHeight: 1.45,
+  whiteSpace: "pre-wrap",
 };
 
 const helpButtonStyle: React.CSSProperties = {
@@ -1855,6 +2154,13 @@ const loadedFileHeaderStyle: React.CSSProperties = {
   alignItems: "flex-start",
   justifyContent: "space-between",
   gap: 12,
+};
+
+const loadedActionGroupStyle: React.CSSProperties = {
+  display: "flex",
+  flex: "0 0 auto",
+  flexDirection: "column",
+  gap: 8,
 };
 
 const loadedFileInfoStyle: React.CSSProperties = {
