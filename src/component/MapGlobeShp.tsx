@@ -1250,16 +1250,23 @@ const MapGlobeShp = () => {
         if (obj.type === "FeatureCollection" && Array.isArray(obj.features)) return obj.features;
         if (obj.type === "Feature") return [obj];
         if (obj.type && obj.coordinates) return [{ type: "Feature" as const, properties: {}, geometry: obj }];
-        if (Array.isArray(obj)) return obj.flatMap(item => extractFeatures(item));
+        if (Array.isArray(obj)) return obj.flatMap((item: any) => extractFeatures(item));
         if (obj.features && Array.isArray(obj.features)) return obj.features;
         if (obj.geojson && obj.geojson.features) return obj.geojson.features;
         return [];
       };
 
-      if (parsed.layers && Array.isArray(parsed.layers)) {
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]?.type === "FeatureCollection") {
+        // Array of FeatureCollection layers, each with optional fileName
+        parsedLayers = parsed.map((layer: any, idx: number) => ({
+          id: `geojson-${idx}`,
+          name: layer.fileName || layer.name || `Layer ${idx + 1}`,
+          features: Array.isArray(layer.features) ? layer.features : [],
+        }));
+      } else if (parsed.layers && Array.isArray(parsed.layers)) {
         parsedLayers = parsed.layers.map((layer: any, idx: number) => ({
           id: layer.id || `layer-${idx}`,
-          name: layer.name || `Layer ${idx + 1}`,
+          name: layer.fileName || layer.name || `Layer ${idx + 1}`,
           features: extractFeatures(layer),
         }));
       } else {
@@ -1267,7 +1274,6 @@ const MapGlobeShp = () => {
         if (features.length > 0) {
           parsedLayers = [{ features }];
         } else {
-          // Fallback: search values for features
           for (const val of Object.values(parsed)) {
             const feats = extractFeatures(val);
             if (feats.length > 0) {
